@@ -48,4 +48,24 @@ public class RendezvousService {
                 // return host's network coordinates to peer2
                 return new ConnectionInfoResponse(room.getHostIp(), room.getHostPort());
         }
+
+        public ConnectionInfoResponse checkHostStatus(String hostId) {
+                // find the room
+                SessionRoom room = repository.findById(hostId)
+                        .orElseThrow(() -> new IllegalArgumentException("Room expired or not found."));
+
+                // check peer2 info
+                if (room.getPeerIp() != null && room.getPeerPort() != 0) {
+                        // extract peer2 info
+                        ConnectionInfoResponse peerInfo = new ConnectionInfoResponse(room.getPeerIp(), room.getPeerPort());
+                        // clean up
+                        // Since connnection is established, we can delete room
+                        repository.deleteById(hostId);
+
+                        return peerInfo;
+                }
+
+                // null if peer2 hasn't connected
+                return null;
+        }
 }

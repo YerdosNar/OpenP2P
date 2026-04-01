@@ -1,6 +1,8 @@
 package com.example.openp2p.controller;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -57,6 +59,26 @@ public class RendezvousController {
                 }
                 catch (IllegalArgumentException e) {
                         // return 400 bad req if the host isn't found or pw is wrong
+                        return ResponseEntity.badRequest().body(e.getMessage());
+                }
+        }
+
+        @GetMapping("/host/{hostId}/status")
+        public ResponseEntity<?> checkStatus(@PathVariable String hostId) {
+                try {
+                        ConnectionInfoResponse peerInfo = service.checkHostStatus(hostId);
+
+                        if (peerInfo != null) {
+                                // peer2 has joined. send IP:port bakc
+                                return ResponseEntity.ok(peerInfo);
+                        }
+                        else {
+                                // return 202 indicating we are waiting
+                                return ResponseEntity.status(202).body("Waiting for peer...");
+                        }
+                }
+                catch(IllegalArgumentException e) {
+                        // return 400 if 3 mins passed
                         return ResponseEntity.badRequest().body(e.getMessage());
                 }
         }
