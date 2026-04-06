@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+gcc -o exe_ren rendezvous.c
+./exe_ren
