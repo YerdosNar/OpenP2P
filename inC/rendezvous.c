@@ -37,17 +37,19 @@ char *ask_n_receive(
         const char      *prompt,
         int32_t         client_fd
 ) {
-        char            buffer[0xff];
+        char            *buffer = calloc(0xff, sizeof(char));
         int32_t         bytes_received;
 
-        char send_prompt[20];
-        snprintf(send_prompt, sizeof(send_prompt), "Enter HostRoom %s: ", prompt);
+        char            send_prompt[20];
+        snprintf(
+                        send_prompt,
+                        sizeof(send_prompt),
+                        "Enter HostRoom %s: ", prompt);
         send(
-                client_fd,
-                send_prompt,
-                strlen(send_prompt),
-                0);
-        memset(buffer, 0, sizeof(buffer));
+                        client_fd,
+                        send_prompt,
+                        strlen(send_prompt),
+                        0);
         bytes_received = recv(
                         client_fd,
                         buffer,
@@ -74,9 +76,11 @@ void handle_host(
         // Ask for and receive room ID
         char *id = ask_n_receive("ID", client_fd);
         strncpy(room->room_id, id, MAX_ID_LEN - 1);
+        free(id);
         // Ask and recv password;
         char *pw = ask_n_receive("PW", client_fd);
         strncpy(room->room_password, pw, MAX_ID_LEN - 1);
+        free(pw);
 
         strncpy(room->host_ip, peer_ip, MAX_IP_LEN - 1);
         room->host_port         = peer_port;
@@ -96,9 +100,6 @@ void handle_joiner(
         uint16_t peer_port,
         Room *room
 ) {
-        char buffer[0xff];
-        int32_t bytes_received;
-
         // ask for ID to verify
         char *id = ask_n_receive("ID", client_fd);
         char *r_id = room->room_id;
@@ -133,6 +134,8 @@ void handle_joiner(
         send(client_fd, msg_to_join, strlen(msg_to_join), 0);
 
         printf("Handshake completed! Tearing down rendezvous down...\n");
+        free(id);
+        free(pw);
         close(room->host_fd);
         close(client_fd);
         room->is_active = false;
@@ -245,8 +248,6 @@ int main(int argc, char **argv)
                         printf("ACTION: Room is active. Processing Peer2 as Joiner...\n");
                         handle_joiner(client_fd, peer_ip, peer_port, &hosted_room);
                 }
-
-                close(client_fd);
         }
 
         close(server_fd);

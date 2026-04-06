@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
 
-gcc -o exe_ren rendezvous.c
+if [[ ! -f exe_ren || rendezvous.c -nt exe_ren ]]; then
+        gcc -o exe_ren rendezvous.c -Wall -Wextra
+fi
+
 ./exe_ren
