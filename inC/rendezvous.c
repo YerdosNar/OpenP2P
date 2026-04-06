@@ -1,38 +1,3 @@
-/*
- * OpenP2P
- *
- * take one peer1's IP:Port
- * peer1 becomes the host
- * peer1 sets a password and ID
- * ID -> to find if the host exist
- * Password -> to join the hosted room
- *
- * set a timer for 3 minutes
- * if (host_expired()) {
- *      delete_room();
- * }
- * else {
- *      wait_for_peer2();
- * }
- *
- * take peer2's IP:Port
- * ask for ID
- * if (input_id == host_id) {
- *      ask for password
- *      if (input_pw == host_pw) {
- *              sendIPs();
- *      }
- * }
- *
- * supported flag:
- *      -p, --port [num]        port to listen for peers
- *      -l, --log [filename]   to log connections (default filename: "con.log")
- *
- *
- * FURTHER IMPROVEMENTS:
- *      Add threads, there will be threads for each
- */
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +10,9 @@
 #include <unistd.h>
 
 // buffer lengths
-#define MAX_ID_LEN 64
-#define MAX_PW_LEN 64
-#define MAX_IP_LEN 16
+#define MAX_ID_LEN              64
+#define MAX_PW_LEN              64
+#define MAX_IP_LEN              16
 
 // default vals
 #define DEFAULT_PORT            8888
@@ -68,13 +33,12 @@ void strip_newline(char *str) {
 }
 
 // Ask and receive info from peer
-void ask_n_receive(
-        Room            *room,
+char *ask_n_receive(
         const char      *prompt,
         int32_t         client_fd
 ) {
         char            buffer[0xff];
-        uint32_t        bytes_received;
+        int32_t         bytes_received;
 
         char send_prompt[20];
         snprintf(send_prompt, sizeof(send_prompt), "Enter HostRoom %s: ", prompt);
@@ -95,32 +59,24 @@ void ask_n_receive(
                         "ERROR: Disconnected during %s input.\n",
                         prompt);
                 close(client_fd);
-                return;
+                return "NOT FOUND";
         }
         strip_newline(buffer);
-
-        if (!strncmp(prompt, "ID", 2)) {
-                strncpy(room->room_id, buffer, MAX_ID_LEN - 1);
-        }
-        else if (!strncmp(prompt, "PW", 2)) {
-                strncpy(room->room_password, buffer, MAX_ID_LEN - 1);
-        }
-        else {
-                fprintf(stderr, "ERROR: Unknown prompt: %s\n", prompt);
-                return;
-        }
+        return buffer;
 }
 
 void handle_host(
-        int             client_fd,
-        const char   *peer_ip,
+        int32_t         client_fd,
+        const char      *peer_ip,
         uint16_t        peer_port,
         Room            *room
 ) {
         // Ask for and receive room ID
-        ask_n_receive(room, "ID", client_fd);
+        char *id = ask_n_receive("ID", client_fd);
+        strncpy(room->room_id, id, MAX_ID_LEN - 1);
         // Ask and recv password;
-        ask_n_receive(room, "PW", client_fd);
+        char *pw = ask_n_receive("PW", client_fd);
+        strncpy(room->room_password, pw, MAX_ID_LEN - 1);
 
         strncpy(room->host_ip, peer_ip, MAX_IP_LEN - 1);
         room->host_port         = peer_port;
@@ -132,6 +88,54 @@ void handle_host(
 
         const char *success_msg = "Room created successfully. Waiting for peer to join...\n";
         send(client_fd, success_msg, strlen(success_msg), 0);
+}
+
+void handle_joiner(
+        int32_t client_fd,
+        const char *peer_ip,
+        uint16_t peer_port,
+        Room *room
+) {
+        char buffer[0xff];
+        int32_t bytes_received;
+
+        // ask for ID to verify
+        char *id = ask_n_receive("ID", client_fd);
+        char *r_id = room->room_id;
+        if (strncmp(id, r_id, strlen(r_id))) {
+                const char *err_msg = "ERROR: Invalid ID.\n";
+                send(client_fd, err_msg, strlen(err_msg), 0);
+                printf("Joiner provided wrong Room ID.\n");
+                close(client_fd);
+                return; // room is open, but joiner is kicked
+        }
+        // ask for PW to authenticate
+        char *pw = ask_n_receive("PW", client_fd);
+        char *r_pw = room->room_password;
+        if (strncmp(pw, r_pw, strlen(r_pw))) {
+                const char *err_msg = "ERROR: Invalid password.\n";
+                send(client_fd, err_msg, strlen(err_msg), 0);
+                printf("Joiner provided wrong Room password.\n");
+                close(client_fd);
+                return;
+        }
+
+        // If everything is correct
+        printf("Credentials matched! Exchanging IP:Port\n");
+
+        char msg_to_host[0xff];
+        char msg_to_join[0xff];
+
+        snprintf(msg_to_host, sizeof(msg_to_host), "%s:%d\n", peer_ip, peer_port);
+        snprintf(msg_to_join, sizeof(msg_to_join), "%s:%d\n", room->host_ip, room->host_port);
+
+        send(room->host_fd, msg_to_host, strlen(msg_to_host), 0);
+        send(client_fd, msg_to_join, strlen(msg_to_join), 0);
+
+        printf("Handshake completed! Tearing down rendezvous down...\n");
+        close(room->host_fd);
+        close(client_fd);
+        room->is_active = false;
 }
 
 int main(int argc, char **argv)
@@ -239,8 +243,7 @@ int main(int argc, char **argv)
                 }
                 else {
                         printf("ACTION: Room is active. Processing Peer2 as Joiner...\n");
-                        // TODO: handle_joiner();
-                        close(client_fd);
+                        handle_joiner(client_fd, peer_ip, peer_port, &hosted_room);
                 }
 
                 close(client_fd);
