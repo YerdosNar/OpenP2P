@@ -13,6 +13,7 @@
 #define MAX_ID_LEN              64
 #define MAX_PW_LEN              64
 #define MAX_IP_LEN              16
+#define MAX_ROOMS               5000
 
 // default vals
 #define DEFAULT_PORT            8888
@@ -39,8 +40,8 @@ char *ask_n_receive(
 ) {
         char            *buffer = calloc(0xff, sizeof(char));
         int32_t         bytes_received;
-        char send_prompt[strlen(prompt) + 8];           // "INPUT: \0" = 7 chars
-        snprintf(send_prompt, sizeof(send_prompt) - 1, "INPUT: %s", prompt);
+        char send_prompt[strlen(prompt) + 9];           // "INPUT: \0" = 7 chars
+        snprintf(send_prompt, sizeof(send_prompt) - 1, "INPUT: %s ", prompt);
 
         send(
                         client_fd,
@@ -95,13 +96,12 @@ void handle_joiner(
         int32_t client_fd,
         const char *peer_ip,
         uint16_t peer_port,
-        Room rooms[],
-        uint8_t room_count
+        Room rooms[]
 ) {
         Room *room = NULL;
         // ask for ID to verify
         char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
-        for (uint8_t i = 0; i < room_count; i++) {
+        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
                 if (rooms[i].is_active) {
                         char *r_id = rooms[i].room_id;
                         if (!strncmp(r_id, id, strlen(r_id))) {
@@ -151,11 +151,23 @@ void handle_joiner(
         room->is_active = false;
 }
 
+void count_print_available_rooms(Room rooms[]) {
+        uint8_t sum = 0;
+        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
+                if (!rooms[i].is_active) {
+                        sum++;
+                }
+        }
+
+        printf("INFO: Number of available rooms: %u\n", sum);
+}
+
 void usage(const char *exe_file) {
         printf("Usage: %s [options]\n\n", exe_file);
         printf("Options:\n");
         printf("        -p, --port <port num>           Set port number to listen (default=8888)\n");
         printf("        -l, --log <filename>            Set logging filename (default='con.log')\n");
+        printf("        -m, --max-rooms <number>        Set max room number in queue (default=5000)\n");
         printf("        -h, --help                      Show this help message\n\n");
         printf("Example:\n");
         printf("        %s -p 2222 -l logging\n", exe_file);
@@ -166,6 +178,7 @@ int main(int argc, char **argv)
 {
         uint16_t listen_port = DEFAULT_PORT;
         char *log_filename = DEFAULT_LOG_FILE;
+        uint32_t max_rooms = MAX_ROOMS;
 
         // cmd arg parsing
         if (argc >= 2) {
@@ -186,6 +199,14 @@ int main(int argc, char **argv)
                                 }
                                 else {
                                         printf("No filename provided. Default: 'con.log'\n");
+                                }
+                        }
+                        else if (!strncmp(argv[i], "-m" 2) || !strncmp(argv[i], "--max-rooms", 11)) {
+                                if (i + 1 < argc) {
+                                        max_rooms = atoi(argv[++i]);
+                                }
+                                else {
+                                        printf("No number provided. Default: 5000\n");
                                 }
                         }
                         else if (!strncmp(argv[i], "-h", 2) || !strncmp(argv[i], "--help", 6)) {
@@ -232,7 +253,7 @@ int main(int argc, char **argv)
 
         printf("Server successfully started and listening on port %d...\n", listen_port);
 
-        Room rooms[10] = {0};
+        Room rooms[MAX_ROOMS] = {0};
         uint8_t count = 0;
         // loop
         for (;;) {
@@ -259,7 +280,7 @@ int main(int argc, char **argv)
                         || !strncmp(host_join, "h", 1))
                 {
                         bool slot_found = false;
-                        for (uint8_t i = 0; i < 10; i++) {
+                        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
                                 if (!rooms[i].is_active) {
                                         handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
                                         slot_found = true;
@@ -275,7 +296,7 @@ int main(int argc, char **argv)
                 else if (!strncmp(host_join, "J", 1)
                         || !strncmp(host_join, "j", 1))
                 {
-                        handle_joiner(client_fd, peer_ip, peer_port, rooms, 10);
+                        handle_joiner(client_fd, peer_ip, peer_port, rooms);
                 }
                 else {
                         const char *err = "ERROR: Invalid selection.\n";
@@ -283,7 +304,8 @@ int main(int argc, char **argv)
                         close(client_fd);
                 }
 
-                printf("INFO: Rooms available: %d\n", 10-count);
+                count %= MAX_ROOMS;
+                count_print_available_rooms(rooms);
                 free(host_join);
         }
 
