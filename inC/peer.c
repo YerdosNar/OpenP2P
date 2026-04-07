@@ -226,7 +226,9 @@ int main(int argc, char **argv) {
         printf("\n=== === === === === === === === ===\n");
 
         char test_msg[64];
-        snprintf(test_msg, sizeof(test_msg), "Hello Port:%d", local_port);
+        printf("Please enter your name: ");
+        fgets(test_msg, sizeof(test_msg)-1, stdin);
+        test_msg[strcspn(test_msg, "\r\n")] = 0;
         send(p2p_fd, test_msg, strlen(test_msg), 0);
 
         char p2p_buffer[0xff] = {0};
