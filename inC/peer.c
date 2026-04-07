@@ -38,6 +38,16 @@ void resolve_dom_name(const char *domain_name, char *server_ip) {
         }
 }
 
+bool recv_all(int32_t fd, void *buf, size_t len) {
+        size_t total = 0;
+        while (total < len) {
+                int32_t r = recv(fd, (uint8_t*)buf + total, len - total, 0);
+                if (r <= 0) return false;
+                total += r;
+        }
+        return true;
+}
+
 Config parse_args(int argc, char **argv) {
         Config cfg;
         strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
@@ -104,8 +114,8 @@ void set_sockopt(int32_t sock_fd) {
 }
 
 int32_t make_bound_socket(const struct sockaddr_in *local_addr) {
-        int32_t fd;
-        if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        int32_t fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd == -1) {
                 fprintf(stderr, "ERROR: Socket creation failed.\n");
                 return -1;
         }
@@ -118,6 +128,7 @@ int32_t make_bound_socket(const struct sockaddr_in *local_addr) {
                 sizeof(*local_addr)) < 0)
         {
                 fprintf(stderr, "ERROR: bind() failed.\n");
+                close(fd);
                 return -1;
         }
 
@@ -128,10 +139,8 @@ int32_t connect_to_rendezvous(
         const Config            *cfg,
         const struct sockaddr_in *local_addr)
 {
-        int32_t fd;
-        if ((fd = make_bound_socket(local_addr)) == -1) {
-                return -1;
-        }
+        int32_t fd = make_bound_socket(local_addr);
+        if (fd == -1) return -1;
 
         struct sockaddr_in server_addr = {0};
         server_addr.sin_family          = AF_INET;
@@ -172,9 +181,8 @@ bool do_rendezvous_exchange(int32_t rendezvous_fd, PeerInfo *peer) {
                 printf("%s", buffer);
                 fflush(stdout); // It should print before input
 
-                // server ERROR
+                // if server ERROR
                 if (strstr(buffer, "ERROR")) {
-                        close(rendezvous_fd);
                         return false;
                 }
 
@@ -223,10 +231,202 @@ int32_t do_hole_punch(
                 }
 
                 close(fd);
-                printf("Punch attempt %d failed. Retrying in ...\n", i + 1);
+                printf("Punch attempt %d failed. Retrying...\n", i + 1);
         }
 
         return -1;
+}
+
+bool do_key_exchange(
+        int32_t         p2p_fd,
+        uint8_t         rx_key[crypto_kx_SESSIONKEYBYTES],
+        uint8_t         tx_key[crypto_kx_SESSIONKEYBYTES])
+{
+        uint8_t my_pub_key[crypto_kx_PUBLICKEYBYTES];
+        uint8_t my_sec_key[crypto_kx_SECRETKEYBYTES];
+        crypto_kx_keypair(my_pub_key, my_sec_key);
+
+        printf("Generated local encryption keys. Trading public keys with peer...\n");
+
+        // Send our public key
+        if (send(p2p_fd, my_pub_key, crypto_kx_PUBLICKEYBYTES, 0) < 0)
+        {
+                fprintf(stderr, "ERROR: Failed to send public key.\n");
+                sodium_memzero(my_sec_key, sizeof(my_sec_key));
+                return false;
+        }
+
+        printf("Sent public key.\n");
+
+        uint8_t peer_pub_key[crypto_kx_PUBLICKEYBYTES];
+        if (!recv_all(p2p_fd, peer_pub_key, crypto_kx_PUBLICKEYBYTES))
+        {
+                fprintf(stderr, "ERROR: Disconnected during key exchange.\n");
+                sodium_memzero(my_sec_key, sizeof(my_sec_key));
+                return false;
+        }
+        printf("Received public key from peer.\n");
+
+        // Decide vlient vs server role by comparing public keys
+        int32_t cmp = memcmp(my_pub_key, peer_pub_key, crypto_kx_PUBLICKEYBYTES);
+        if (cmp == 0) {
+                fprintf(stderr, "ERROR: Public keys are identical (connected to self?)");
+                sodium_memzero(my_sec_key, sizeof(my_sec_key));
+                return false;
+        }
+
+        uint32_t ret;
+        if (cmp < 0) {
+                // lower key -> client role
+                ret = crypto_kx_client_session_keys(
+                        rx_key, tx_key,
+                        my_pub_key, my_sec_key,
+                        peer_pub_key);
+                printf("Acting as Client for Key Derivation.\n");
+        }
+        else {
+                // higher key -> server role
+                ret = crypto_kx_server_session_keys(
+                        rx_key, tx_key,
+                        my_pub_key, my_sec_key,
+                        peer_pub_key);
+                printf("Acting as Server for Key Derivation.\n");
+        }
+
+        sodium_memzero(my_sec_key, sizeof(my_sec_key));
+
+        if (ret != 0) {
+                fprintf(stderr, "ERROR: Session keys derivation failed.\n");
+                return false;
+        }
+
+        printf("SUCCESS: E2EE Session Keys generated.\n");
+        return true;
+}
+
+/*
+* Encrypts 'msg' first with 'tx_key' and sends over 'fd'
+* Structure [nonce | net_len | ciphertext]
+*
+* RETURN true on success
+*/
+bool encrypt_and_send(
+        int32_t         fd,
+        const char      *msg,
+        const uint8_t   tx_key[crypto_kx_SESSIONKEYBYTES])
+{
+        uint32_t msg_len        = strlen(msg);
+        uint32_t ciphertext_len = msg_len + crypto_secretbox_MACBYTES;
+     size_t   packet_size    = crypto_secretbox_NONCEBYTES   +
+                                        sizeof(uint32_t)        +
+                                        ciphertext_len;
+
+        uint8_t *packet = malloc(packet_size);
+        if (!packet) {
+                fprintf(stderr, "ERROR: malloc() failed for send packet.\n");
+                return false;
+        }
+
+        // Write none at the front
+        uint8_t *nonce = packet;
+        randombytes_buf(nonce, crypto_secretbox_NONCEBYTES);
+
+        // Write length in network byte order
+        uint32_t net_len = htonl(msg_len);
+        memcpy(packet + crypto_secretbox_NONCEBYTES,
+               &net_len, sizeof(uint32_t));
+
+        // Encrypt into the rest of the packet
+        uint8_t *ciphertext = packet + crypto_secretbox_NONCEBYTES +
+                sizeof(uint32_t);
+        crypto_secretbox_easy(
+                ciphertext,
+                (const uint8_t*)msg,
+                msg_len, nonce, tx_key);
+
+        bool ok = (send(fd, packet, packet_size, 0) >= 0);
+        if (!ok) {
+                fprintf(stderr, "ERROR: Failed to send encrypted message.\n");
+        }
+        else {
+                printf("Sent encrypted message: '%s'\n", msg);
+        }
+
+        free(packet);
+        return ok;
+}
+
+/*
+ * receives [nonce | net_len | ciphertext]
+ * decrypts with rx_key, and prints
+ *
+ * RETURN true on success
+ */
+bool recv_and_decrypt(
+        int32_t         fd,
+        const uint8_t   rx_key[crypto_kx_SESSIONKEYBYTES])
+{
+        printf("Waiting for peer's encrypted message...\n");
+
+        // Read nonce
+        uint8_t nonce[crypto_secretbox_NONCEBYTES];
+        if (!recv_all(fd, nonce, sizeof(nonce))) {
+                fprintf(stderr, "ERROR: Disconnected reading nonce.\n");
+                return false;
+        }
+
+        // Read message length
+        uint32_t net_len;
+        if (!recv_all(fd, &net_len, sizeof(net_len))) {
+                fprintf(stderr, "ERROR: Disconnected reading message length.\n");
+                return false;
+        }
+
+        uint32_t msg_len        = ntohl(net_len);
+        uint32_t ciphertext_len = msg_len + crypto_secretbox_MACBYTES;
+
+        // Read ciphertext
+        uint8_t *ciphertext = malloc(ciphertext_len);
+        if (!ciphertext) {
+                fprintf(stderr, "ERROR: malloc() failed for recv ciphertext.\n");
+                free(ciphertext);
+                return false;
+        }
+        if (!recv_all(fd, ciphertext, ciphertext_len)) {
+                fprintf(stderr, "ERROR: Disconnected reading ciphertext.\n");
+                free(ciphertext);
+                return false;
+        }
+
+        // Decrypt
+        uint8_t *plaintext = malloc(msg_len + 1);
+        if (!plaintext) {
+                fprintf(stderr, "ERROR: malloc() failed for plaintext\n");
+                free(ciphertext);
+                return false;
+        }
+
+        bool ok = false;
+        if (crypto_secretbox_open_easy(
+                plaintext,
+                ciphertext,
+                ciphertext_len,
+                nonce,
+                rx_key) != 0)
+        {
+                fprintf(stderr, "FATAL ERROR: Message was forged or corrupted.\n");
+        }
+        else {
+                plaintext[msg_len] = '\0';
+                printf("\n=== === === === === === === === ===\n");
+                printf("SECURE MSG RX: %s", plaintext);
+                printf("\n=== === === === === === === === ===\n");
+                ok = true;
+        }
+
+        free(plaintext);
+        free(ciphertext);
+        return ok;
 }
 
 int main(int argc, char **argv) {
@@ -241,19 +441,16 @@ int main(int argc, char **argv) {
         local_addr.sin_port             = htons(cfg.local_port);
 
         int32_t rendezvous_fd = connect_to_rendezvous(&cfg, &local_addr);
-        if (rendezvous_fd == -1) {
-                return 1;
-        }
+        if (rendezvous_fd == -1) return 1;
 
         PeerInfo peer = {0};
-        bool get_peer = do_rendezvous_exchange(rendezvous_fd, &peer);
+        bool got_peer = do_rendezvous_exchange(rendezvous_fd, &peer);
         close(rendezvous_fd);
 
-        if (!get_peer) {
+        if (!got_peer) {
                 return 1;
         }
 
-        // Let's wait until Rendezvous connection is closed
         int32_t p2p_fd = do_hole_punch(&peer, &local_addr, 15);
         if (p2p_fd == -1) {
                 printf("\nERROR: TCP Hole Punch failed after 15 attempts. The NATs might be too strict.\n");
@@ -271,189 +468,31 @@ int main(int argc, char **argv) {
                 return 1;
         }
 
-        uint8_t my_pub_key[crypto_kx_PUBLICKEYBYTES];
-        uint8_t my_sec_key[crypto_kx_SECRETKEYBYTES];
-        crypto_kx_keypair(my_pub_key, my_sec_key);
+        uint8_t rx_key[crypto_kx_SESSIONKEYBYTES];
+        uint8_t tx_key[crypto_kx_SESSIONKEYBYTES];
 
-        printf("Generated local encryption keys. Trading public keys with peer...\n");
-
-        // Exchange public keys
-        uint8_t peer_pub_key[crypto_kx_PUBLICKEYBYTES];
-
-        if (send(
-                p2p_fd,
-                my_pub_key,
-                crypto_kx_PUBLICKEYBYTES,
-                0) < 0)
+        if (!do_key_exchange(p2p_fd, rx_key, tx_key))
         {
-                fprintf(stderr, "ERROR: Failed to send public key.\n");
                 close(p2p_fd);
                 return 1;
         }
-        printf("Sent public key to %s:%d\n", target_ip, target_port);
 
-        int32_t bytes_read = 0;
-        while (bytes_read < crypto_kx_PUBLICKEYBYTES) {
-                int32_t r = 0;
-                if ((r = recv(
-                        p2p_fd,
-                        peer_pub_key + bytes_read,
-                        crypto_kx_PUBLICKEYBYTES - bytes_read,
-                        0)) <= 0)
-                {
-                        fprintf(stderr, "ERROR: Disconnected during key exchange.\n");
-                        close(p2p_fd);
-                        return 1;
-                }
-                bytes_read += r;
-        }
-        printf("Received public key from %s:%d\n", target_ip, target_port);
-
-        // Deciding who is "client", who "server"
-        uint8_t rx_key[crypto_kx_SECRETKEYBYTES];
-        uint8_t tx_key[crypto_kx_SECRETKEYBYTES];
-
-        int32_t cmp = memcmp(my_pub_key, peer_pub_key, crypto_kx_PUBLICKEYBYTES);
-        if (cmp == 0) {
-                fprintf(stderr, "ERROR: Public keys are identical (someone connected to themselves?)\n");
-                close(p2p_fd);
-                return 1;
-        }
-        else if (cmp < 0) {
-                if (crypto_kx_client_session_keys(
-                        rx_key,
-                        tx_key,
-                        my_pub_key,
-                        my_sec_key,
-                        peer_pub_key) != 0)
-                {
-                        fprintf(stderr, "ERROR: Client session key derivation failed.\n");
-                        return 1;
-                }
-                printf("Acting as Client for Key Derivation.\n");
-        }
-        else {
-                if (crypto_kx_server_session_keys(
-                        rx_key,
-                        tx_key,
-                        my_pub_key,
-                        my_sec_key,
-                        peer_pub_key) != 0)
-                {
-                        fprintf(stderr, "ERROR: Server session key derivation failed.\n");
-                        return 1;
-                }
-                printf("Acting as Server for Key Derivation.\n");
-        }
-
-        printf("SUCESS: E2EE Session Keys generated.\n");
-        sodium_memzero(my_sec_key, sizeof(my_sec_key));
-
+        // Share the name
         char my_name[64];
         printf("Please enter your name: ");
         fgets(my_name, sizeof(my_name)-1, stdin);
         my_name[strcspn(my_name, "\r\n")] = 0;
-        uint32_t msg_len = strlen(my_name);
-        uint32_t cipher_text_len = msg_len + crypto_secretbox_MACBYTES;
 
-        // Alocating space for entire packet
-        size_t packet_size =
-                crypto_secretbox_NONCEBYTES +
-                sizeof(uint32_t)            +
-                cipher_text_len;
-        uint8_t *packet = malloc(packet_size);
-
-        // generate nonce into the start
-        uint8_t *nonce = packet;
-        randombytes_buf(nonce, crypto_secretbox_NONCEBYTES);
-
-        // convert length to network order and send
-        uint32_t net_len = htonl(msg_len);
-        memcpy(packet +
-               crypto_secretbox_NONCEBYTES,
-               &net_len, sizeof(uint32_t));
-
-        // encrypt
-        uint8_t *ciphertext = packet +
-                crypto_secretbox_NONCEBYTES +
-                sizeof(uint32_t);
-        crypto_secretbox_easy(
-                ciphertext,
-                (const uint8_t*)my_name,
-                msg_len,
-                nonce,
-                tx_key);
-
-        // blast secure packet across p2p socket
-        if (send(
-                p2p_fd,
-                packet,
-                packet_size,
-                0) < 0)
-        {
-                fprintf(stderr, "ERROR: Failed to send encrypted message.\n");
-        }
-        else {
-                printf("Sent encrypted message: '%s'\n", my_name);
-        }
-        free(packet);
-
-        // receive and decrypt now
-        uint8_t recv_nonce[crypto_secretbox_NONCEBYTES];
-        uint32_t recv_net_len;
-
-        printf("Waiting for peer's encrypted message...\n");
-
-        // read nonce
-        recv(
-                p2p_fd,
-                recv_nonce,
-                sizeof(recv_nonce),
-                0
-        );
-
-        // read the message
-        recv(
-                p2p_fd,
-                &recv_net_len,
-                sizeof(recv_net_len),
-                0
-        );
-        uint32_t recv_msg_len = ntohl(recv_net_len);
-        uint32_t recv_ciphertext_len = recv_msg_len + crypto_secretbox_MACBYTES;
-
-        // Read the actual text now
-        uint8_t *recv_ciphertext = malloc(recv_ciphertext_len);
-        int32_t c_bytes = recv(
-                p2p_fd,
-                recv_ciphertext,
-                recv_ciphertext_len,
-                0
-        );
-
-        if (c_bytes > 0) {
-                // Decrypt
-                uint8_t *decrypted_msg = malloc(recv_msg_len + 1);
-
-                if (crypto_secretbox_open_easy(
-                        decrypted_msg,
-                        recv_ciphertext,
-                        recv_ciphertext_len,
-                        recv_nonce,
-                        rx_key) != 0)
-                {
-                        fprintf(stderr, "FATAL ERROR: Message was forged or corrupted.\n");
-                }
-                else {
-                        decrypted_msg[recv_msg_len] = '\0';
-                        printf("\n=== === === === === === === === ===\n");
-                        printf("SECURE MSG RX: %s", decrypted_msg);
-                        printf("\n=== === === === === === === === ===\n");
-                }
-                free(decrypted_msg);
+        if (!encrypt_and_send(p2p_fd, my_name, tx_key)) {
+                close(p2p_fd);
+                return 1;
         }
 
-        free(recv_ciphertext);
+        if (!recv_and_decrypt(p2p_fd, rx_key)) {
+                close(p2p_fd);
+                return 1;
+        }
+
         close(p2p_fd);
         return 0;
 }
