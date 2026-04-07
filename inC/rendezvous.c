@@ -34,17 +34,12 @@ void strip_newline(char *str) {
 
 // Ask and receive info from peer
 char *ask_n_receive(
-        const char      *prompt,
+        const char      *send_prompt,
         int32_t         client_fd
 ) {
         char            *buffer = calloc(0xff, sizeof(char));
         int32_t         bytes_received;
 
-        char            send_prompt[20];
-        snprintf(
-                        send_prompt,
-                        sizeof(send_prompt),
-                        "Enter HostRoom %s: ", prompt);
         send(
                         client_fd,
                         send_prompt,
@@ -59,7 +54,7 @@ char *ask_n_receive(
         if (bytes_received <= 0) {
                 fprintf(stderr,
                         "ERROR: Disconnected during %s input.\n",
-                        prompt);
+                        send_prompt);
                 close(client_fd);
                 return "NOT FOUND";
         }
@@ -74,11 +69,11 @@ void handle_host(
         Room            *room
 ) {
         // Ask for and receive room ID
-        char *id = ask_n_receive("ID", client_fd);
+        char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
         strncpy(room->room_id, id, MAX_PW_LEN - 1);
         free(id);
         // Ask and recv password;
-        char *pw = ask_n_receive("PW", client_fd);
+        char *pw = ask_n_receive("Enter HostRoom password: ", client_fd);
         strncpy(room->room_password, pw, MAX_ID_LEN - 1);
         free(pw);
 
@@ -98,20 +93,22 @@ void handle_joiner(
         int32_t client_fd,
         const char *peer_ip,
         uint16_t peer_port,
-        Room *room
+        Room rooms[],
+        uint8_t room_count
 ) {
+        Room *room;
         // ask for ID to verify
-        char *id = ask_n_receive("ID", client_fd);
-        char *r_id = room->room_id;
-        if (strncmp(id, r_id, strlen(r_id))) {
-                const char *err_msg = "ERROR: Invalid ID.\n";
-                send(client_fd, err_msg, strlen(err_msg), 0);
-                printf("Joiner provided wrong Room ID.\n");
-                close(client_fd);
-                return; // room is open, but joiner is kicked
+        char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
+        for (uint8_t i = 0; i < room_count; i++) {
+                char *r_id = rooms[i].room_id;
+                if (!strncmp(r_id, id, strlen(r_id))) {
+                        room = &rooms[i];
+                        break;
+                }
         }
+
         // ask for PW to authenticate
-        char *pw = ask_n_receive("PW", client_fd);
+        char *pw = ask_n_receive("Enter HostRoom password: ", client_fd);
         char *r_pw = room->room_password;
         if (strncmp(pw, r_pw, strlen(r_pw))) {
                 const char *err_msg = "ERROR: Invalid password.\n";
@@ -133,7 +130,7 @@ void handle_joiner(
         send(room->host_fd, msg_to_host, strlen(msg_to_host), 0);
         send(client_fd, msg_to_join, strlen(msg_to_join), 0);
 
-        printf("Handshake completed! Tearing down rendezvous down...\n");
+        printf("Handshake completed! Tearing down rendezvous...\n");
         free(id);
         free(pw);
         close(room->host_fd);
@@ -176,7 +173,6 @@ int main(int argc, char **argv)
 
         // Setup server socket
         int32_t server_fd;
-        struct sockaddr_in server_addr;
 
         // Create socket (IPv4, TCP)
         if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
@@ -193,6 +189,7 @@ int main(int argc, char **argv)
         }
 
         // Configure the server address tructure
+        struct sockaddr_in server_addr;
         server_addr.sin_family          = AF_INET;
         server_addr.sin_addr.s_addr     = INADDR_ANY;
         server_addr.sin_port            = htons(listen_port);
@@ -211,6 +208,8 @@ int main(int argc, char **argv)
 
         printf("Server successfully started and listening on port %d...\n", listen_port);
 
+        Room rooms[10] = {0};
+        uint8_t count = 0;
         // loop
         for (;;) {
                 struct sockaddr_in client_addr;
@@ -231,22 +230,17 @@ int main(int argc, char **argv)
                 printf("\n--- New Connection ---\n");
                 printf("Peer connected from %s:%d\n", peer_ip, peer_port);
 
-                // Check for room expiration
-                if (hosted_room.is_active) {
-                        time_t current_time = time(NULL);
-                        if (difftime(current_time, hosted_room.creation_time) > 180.0) {
-                                printf("NOTICE: Existing room has expired (exceeded 3 minutes). Deleting room...\n");
-                                hosted_room.is_active = false;
-                        }
+                char *host_join = ask_n_receive("Are you [H]ost or [J]oin? [h/j]: ", client_fd);
+                if (!strncmp(host_join, "H", 1)
+                        || !strncmp(host_join, "h", 1)
+                        && count < 10)
+                {
+                        handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
                 }
-
-                if (!hosted_room.is_active) {
-                        printf("ACTION: No active room. Setting up Peer 1 as Host...\n");
-                        handle_host(client_fd, peer_ip, peer_port, &hosted_room);
-                }
-                else {
-                        printf("ACTION: Room is active. Processing Peer2 as Joiner...\n");
-                        handle_joiner(client_fd, peer_ip, peer_port, &hosted_room);
+                else if (!strncmp(host_join, "J", 1)
+                        || !strncmp(host_join, "j", 1))
+                {
+                        handle_joiner(client_fd, peer_ip, peer_port, rooms, 10);
                 }
         }
 
