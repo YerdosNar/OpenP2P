@@ -129,6 +129,51 @@ int main(int argc, char **argv) {
 
         printf("Connected successfully!\n");
 
+        char target_ip[MAX_IP_LEN] = {0};
+        uint16_t target_port = 0;
+
+        // handle communication
+        char buffer[1024];
+        for (;;) {
+                memset(buffer, 0, sizeof(buffer));
+                int32_t bytes_received;
+                if ((bytes_received = recv(
+                        sock_fd,
+                        buffer,
+                        sizeof(buffer) - 1,
+                        0)) <= 0
+                ) {
+                        printf("\nConnection to Rendezvous Server closed.\n");
+                        break;
+                }
+
+                // print server message
+                printf("%s", buffer);
+                fflush(stdout); // It should print before input
+
+                // server ERROR
+                if (strstr(buffer, "ERROR")) {
+                        close(sock_fd);
+                        return 1;
+                }
+
+                // if it asking for input
+                if (strstr(buffer, "Enter HostRoom")) {
+                        char input[0xff];
+                        // get input
+                        if (fgets(input, sizeof(input), stdin) != NULL) {
+                                send(sock_fd, input, strlen(input), 0);
+                        }
+                }
+
+                // if server sent Peer IP:Port
+                // FORMAT ("IP:Port\n")
+                else if (sscanf(buffer, "%15[^:]:%hu", target_ip, &target_port) == 2) {
+                        printf("\n>>> Target Peer Acquired: %s:%d <<<\n", target_ip, target_port);
+                        break;
+                }
+        }
+
         close(sock_fd);
         return 0;
 }

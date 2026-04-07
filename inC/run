@@ -4,12 +4,10 @@ if [ "$1" == "-r" ]; then
         if [[ ! -f exe_ren || rendezvous.c -nt exe_ren ]]; then
                 gcc -o exe_ren rendezvous.c -Wall -Wextra
         fi
-        ./exe_ren
 elif [ "$1" == "-p" ]; then
         if [[ ! -f exe_peer || peer.c -nt exe_peer ]]; then
                 gcc -o exe_peer peer.c -Wall -Wextra
         fi
-        ./exe_peer
 elif [ "$1" == "-c" ]; then
         rm exe_*
 fi
