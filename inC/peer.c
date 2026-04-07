@@ -48,6 +48,19 @@ bool recv_all(int32_t fd, void *buf, size_t len) {
         return true;
 }
 
+void usage(const char *exe_file) {
+        printf("Usage: %s [options]\n\n", exe_file);
+        printf("Options:\n");
+        printf("        -s, --server-port <port num>            Server port number      (default=8888)\n");
+        printf("        -i, --ip <ip>                           Server IP address       (default=127.0.0.1)\n");
+        printf("        -l, --local-port <port num>             Set local port number   (default=5000)\n");
+        printf("        -d, --domain-name <dom name>            Server domain name\n");
+        printf("        -h, --help                              Show this help message\n");
+        printf("\n");
+        printf("Example:\n");
+        printf("        %s -d example.com -s 8888\n", exe_file);
+}
+
 Config parse_args(int argc, char **argv) {
         Config cfg;
         strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
@@ -82,6 +95,12 @@ Config parse_args(int argc, char **argv) {
                         if (i + 1 < argc) {
                                 resolve_dom_name(argv[++i], cfg.server_ip);
                         }
+                }
+                else if (!strncmp(argv[i], "-h", 2)
+                        || !strncmp(argv[i], "--help", 6))
+                {
+                        usage(argv[i]);
+                        exit(1);
                 }
         }
         return cfg;
@@ -187,7 +206,7 @@ bool do_rendezvous_exchange(int32_t rendezvous_fd, PeerInfo *peer) {
                 }
 
                 // if it asking for input
-                if (strstr(buffer, "Enter HostRoom")) {
+                if (strstr(buffer, "INPUT: ")) {
                         char input[0xff];
                         // get input
                         if (fgets(input, sizeof(input), stdin) != NULL) {
@@ -231,7 +250,8 @@ int32_t do_hole_punch(
                 }
 
                 close(fd);
-                printf("Punch attempt %d failed. Retrying...\n", i + 1);
+                printf("Punch attempt %d failed. Retrying in a second...\n", i + 1);
+                sleep(1);
         }
 
         return -1;

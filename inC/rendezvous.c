@@ -34,11 +34,13 @@ void strip_newline(char *str) {
 
 // Ask and receive info from peer
 char *ask_n_receive(
-        const char      *send_prompt,
+        const char      *prompt,
         int32_t         client_fd
 ) {
         char            *buffer = calloc(0xff, sizeof(char));
         int32_t         bytes_received;
+        char send_prompt[strlen(prompt) + 8];           // "INPUT: \0" = 7 chars
+        snprintf(send_prompt, sizeof(send_prompt) - 1, "INPUT: %s", prompt);
 
         send(
                         client_fd,
@@ -149,6 +151,17 @@ void handle_joiner(
         room->is_active = false;
 }
 
+void usage(const char *exe_file) {
+        printf("Usage: %s [options]\n\n", exe_file);
+        printf("Options:\n");
+        printf("        -p, --port <port num>           Set port number to listen (default=8888)\n");
+        printf("        -l, --log <filename>            Set logging filename (default='con.log')\n");
+        printf("        -h, --help                      Show this help message\n\n");
+        printf("Example:\n");
+        printf("        %s -p 2222 -l logging\n", exe_file);
+        exit(1);
+}
+
 int main(int argc, char **argv)
 {
         uint16_t listen_port = DEFAULT_PORT;
@@ -175,12 +188,12 @@ int main(int argc, char **argv)
                                         printf("No filename provided. Default: 'con.log'\n");
                                 }
                         }
+                        else if (!strncmp(argv[i], "-h", 2) || !strncmp(argv[i], "--help", 6)) {
+                                usage(argv[i]);
+                        }
                 }
         }
         printf("INFO: Port: %d, Logfile: %s\n", listen_port, log_filename);
-
-        Room hosted_room;
-        hosted_room.is_active = false;
 
         // Setup server socket
         int32_t server_fd;
@@ -270,6 +283,7 @@ int main(int argc, char **argv)
                         close(client_fd);
                 }
 
+                printf("INFO: Rooms available: %d\n", 10-count);
                 free(host_join);
         }
 
