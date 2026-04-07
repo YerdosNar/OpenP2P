@@ -53,7 +53,7 @@ char *ask_n_receive(
         bytes_received = recv(
                         client_fd,
                         buffer,
-                        sizeof(buffer) - 1,
+                        0xff - 1,
                         0);
 
         if (bytes_received <= 0) {

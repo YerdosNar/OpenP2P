@@ -1,4 +1,5 @@
 #include <netdb.h>
+#include <sodium/crypto_kx.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -294,7 +295,7 @@ int main(int argc, char **argv) {
                 printf("Acting as Client for Key Derivation.\n");
         }
         else {
-                if (crypto_kx_client_session_keys(
+                if (crypto_kx_server_session_keys(
                         rx_key,
                         tx_key,
                         my_pub_key,
