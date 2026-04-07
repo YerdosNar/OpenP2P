@@ -11,9 +11,9 @@
 #include <arpa/inet.h>
 #include <sodium.h>
 
+// default values
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
-
 // buffer lengths
 #define MAX_ID_LEN              64
 #define MAX_PW_LEN              64
@@ -197,6 +197,38 @@ bool do_rendezvous_exchange(int32_t rendezvous_fd, PeerInfo *peer) {
         }
 }
 
+int32_t do_hole_punch(
+        const PeerInfo           *peer,
+        const struct sockaddr_in *local_addr,
+        int32_t                  max_attempts)
+{
+        struct sockaddr_in peer_addr = {0};
+        peer_addr.sin_family            = AF_INET;
+        peer_addr.sin_addr.s_addr       = inet_addr(peer->ip);
+        peer_addr.sin_port              = htons(peer->port);
+
+        printf("Initiating TCP Hole Punch to %s:%d...\n",
+               peer->ip, peer->port);
+
+        for (uint8_t i = 0; i < max_attempts; i++) {
+                int32_t fd = make_bound_socket(local_addr);
+                if (fd == -1) return -1;
+
+                if (connect(
+                        fd,
+                        (struct sockaddr*)&peer_addr,
+                        sizeof(peer_addr)) == 0)
+                {
+                        return fd;
+                }
+
+                close(fd);
+                printf("Punch attempt %d failed. Retrying in ...\n", i + 1);
+        }
+
+        return -1;
+}
+
 int main(int argc, char **argv) {
         Config cfg = parse_args(argc, argv);
         printf("INFO: Rendezvous server %s:%d | Local Port %d\n",
@@ -222,46 +254,8 @@ int main(int argc, char **argv) {
         }
 
         // Let's wait until Rendezvous connection is closed
-        int32_t p2p_fd;
-        bool connected = false;
-        struct sockaddr_in peer_addr = {0};
-        peer_addr.sin_family            = AF_INET;
-        peer_addr.sin_addr.s_addr       = inet_addr(target_ip);
-        peer_addr.sin_port              = htons(target_port);
-
-        printf("Initiating TCP Hole Punch to %s:%d...\n", target_ip, target_port);
-
-        // let's try 15 times
-        for (int i = 0; i < 15; i++) {
-                p2p_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-                setsockopt(p2p_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-                setsockopt(p2p_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-
-                if (bind(
-                        p2p_fd,
-                        (struct sockaddr*)&local_addr,
-                        sizeof(local_addr)) < 0
-                ) {
-                        fprintf(stderr, "ERROR: P2P Bind failed.\n");
-                        close(p2p_fd);
-                        return 1;
-                }
-
-                if (connect(
-                        p2p_fd,
-                        (struct sockaddr*)&peer_addr,
-                        sizeof(peer_addr)) == 0
-                ) {
-                        connected = true;
-                        break;
-                }
-
-                close(p2p_fd);
-                printf("Punch attempt %d failed. Retrying in ...\n", i+1);
-        }
-
-        if (!connected) {
+        int32_t p2p_fd = do_hole_punch(&peer, &local_addr, 15);
+        if (p2p_fd == -1) {
                 printf("\nERROR: TCP Hole Punch failed after 15 attempts. The NATs might be too strict.\n");
                 return 1;
         }
