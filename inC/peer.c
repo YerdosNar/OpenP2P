@@ -314,12 +314,107 @@ int main(int argc, char **argv) {
         printf("Please enter your name: ");
         fgets(my_name, sizeof(my_name)-1, stdin);
         my_name[strcspn(my_name, "\r\n")] = 0;
-        send(p2p_fd, my_name, strlen(my_name), 0);
+        uint32_t msg_len = strlen(my_name);
+        uint32_t cipher_text_len = msg_len + crypto_secretbox_MACBYTES;
 
-        char peer_name[64];
-        recv(p2p_fd, peer_name, sizeof(peer_name) - 1, 0);
-        printf("Message from peer: %s\n", peer_name);
+        // Alocating space for entire packet
+        size_t packet_size =
+                crypto_secretbox_NONCEBYTES +
+                sizeof(uint32_t)            +
+                cipher_text_len;
+        uint8_t *packet = malloc(packet_size);
 
+        // generate nonce into the start
+        uint8_t *nonce = packet;
+        randombytes_buf(nonce, crypto_secretbox_NONCEBYTES);
+
+        // convert length to network order and send
+        uint32_t net_len = htonl(msg_len);
+        memcpy(packet +
+               crypto_secretbox_NONCEBYTES,
+               &net_len, sizeof(uint32_t));
+
+        // encrypt
+        uint8_t *ciphertext = packet +
+                crypto_secretbox_NONCEBYTES +
+                sizeof(uint32_t);
+        crypto_secretbox_easy(
+                ciphertext,
+                (const uint8_t*)my_name,
+                msg_len,
+                nonce,
+                tx_key);
+
+        // blast secure packet across p2p socket
+        if (send(
+                p2p_fd,
+                packet,
+                packet_size,
+                0) < 0)
+        {
+                fprintf(stderr, "ERROR: Failed to send encrypted message.\n");
+        }
+        else {
+                printf("Sent encrypted message: '%s'\n", my_name);
+        }
+        free(packet);
+
+        // receive and decrypt now
+        uint8_t recv_nonce[crypto_secretbox_NONCEBYTES];
+        uint32_t recv_net_len;
+
+        printf("Waiting for peer's encrypted message...\n");
+
+        // read nonce
+        recv(
+                p2p_fd,
+                recv_nonce,
+                sizeof(recv_nonce),
+                0
+        );
+
+        // read the message
+        recv(
+                p2p_fd,
+                &recv_net_len,
+                sizeof(recv_net_len),
+                0
+        );
+        uint32_t recv_msg_len = ntohl(recv_net_len);
+        uint32_t recv_ciphertext_len = recv_msg_len + crypto_secretbox_MACBYTES;
+
+        // Read the actual text now
+        uint8_t *recv_ciphertext = malloc(recv_ciphertext_len);
+        int32_t c_bytes = recv(
+                p2p_fd,
+                recv_ciphertext,
+                recv_ciphertext_len,
+                0
+        );
+
+        if (c_bytes > 0) {
+                // Decrypt
+                uint8_t *decrypted_msg = malloc(recv_msg_len + 1);
+
+                if (crypto_secretbox_open_easy(
+                        decrypted_msg,
+                        recv_ciphertext,
+                        recv_ciphertext_len,
+                        recv_nonce,
+                        rx_key) != 0)
+                {
+                        fprintf(stderr, "FATAL ERROR: Message was forged or corrupted.\n");
+                }
+                else {
+                        decrypted_msg[recv_msg_len] = '\0';
+                        printf("\n=== === === === === === === === ===\n");
+                        printf("SECURE MSG RX: %s", decrypted_msg);
+                        printf("\n=== === === === === === === === ===\n");
+                }
+                free(decrypted_msg);
+        }
+
+        free(recv_ciphertext);
         close(p2p_fd);
         return 0;
 }
