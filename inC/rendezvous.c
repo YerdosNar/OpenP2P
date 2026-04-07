@@ -75,7 +75,7 @@ void handle_host(
 ) {
         // Ask for and receive room ID
         char *id = ask_n_receive("ID", client_fd);
-        strncpy(room->room_id, id, MAX_ID_LEN - 1);
+        strncpy(room->room_id, id, MAX_PW_LEN - 1);
         free(id);
         // Ask and recv password;
         char *pw = ask_n_receive("PW", client_fd);
@@ -148,7 +148,7 @@ int main(int argc, char **argv)
 
         // cmd arg parsing
         if (argc >= 2) {
-                char i;
+                uint8_t i;
                 for (i = 1; i < argc; i++) {
                         if (!strncmp(argv[i], "-p", 2) || !strncmp(argv[i], "--port", 6)) {
                                 if (i + 1 < argc) {

@@ -19,62 +19,66 @@
 #define MAX_PW_LEN              64
 #define MAX_IP_LEN              16
 
+typedef struct {
+        char            server_ip[MAX_IP_LEN];
+        uint16_t        server_port;
+        uint16_t        local_port;
+} Config;
+
+typedef struct {
+        char            ip[MAX_IP_LEN];
+        uint16_t        port;
+} PeerInfo;
+
 void resolve_dom_name(const char *domain_name, char *server_ip) {
         struct hostent *ghbn = gethostbyname(domain_name);
         if (ghbn) {
                 char *ip = inet_ntoa(*(struct in_addr *)ghbn->h_addr_list[0]);
-                strncpy(server_ip, ip, strlen(ip));
+                strncpy(server_ip, ip, MAX_IP_LEN - 1);
         }
 }
 
-int main(int argc, char **argv) {
-        char server_ip[MAX_IP_LEN] = "127.0.0.1";
-        uint16_t server_port = DEFAULT_SERVER_PORT;
-        uint16_t local_port = DEFAULT_LOCAL_PORT;
+Config parse_args(int argc, char **argv) {
+        Config cfg;
+        strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
+        cfg.server_port = DEFAULT_SERVER_PORT;
+        cfg.local_port  = DEFAULT_LOCAL_PORT;
 
-        if (argc >= 2) {
-                for (int i = 0; i < argc; i++) {
-                        if (!strncmp(argv[i], "-s", 2)
-                                || !strncmp(argv[i], "--server-port", 13)
-                        ) {
-                                if (i + 1 < argc) {
-                                        server_port = atoi(argv[++i]);
-                                }
+        for (int i = 1; i < argc; i++) {
+                if (!strncmp(argv[i], "-s", 2)
+                        || !strncmp(argv[i], "--server-port", 13))
+                {
+                        if (i + 1 < argc) {
+                                cfg.server_port = atoi(argv[++i]);
                         }
-                        else if(!strncmp(argv[i], "-i", 2)
-                                || !strncmp(argv[i], "--ip", 4)
-                        ) {
-                                if (i + 1 < argc) {
-                                        strncpy(server_ip, argv[++i], strlen(argv[i]));
-                                }
+                }
+                else if (!strncmp(argv[i], "-i", 2)
+                        || !strncmp(argv[i], "--ip", 4))
+                {
+                        if (i + 1 < argc) {
+                                strncpy(cfg.server_ip, argv[++i], MAX_IP_LEN - 1);
                         }
-                        else if(!strncmp(argv[i], "-l", 2)
-                                || !strncmp(argv[i], "--local-port", 12)
-                        ) {
-                                if (i + 1 < argc) {
-                                        local_port = atoi(argv[++i]);
-                                }
+                }
+                else if (!strncmp(argv[i], "-l", 2)
+                        || !strncmp(argv[i], "--local-port", 12))
+                {
+                        if (i + 1 < argc) {
+                                cfg.local_port = atoi(argv[++i]);
                         }
-                        else if(!strncmp(argv[i], "-d", 2)
-                                || !strncmp(argv[i], "--domain-name", 13)
-                        ) {
-                                if (i + 1 < argc) {
-                                        resolve_dom_name(argv[++i], server_ip);
-                                }
+                }
+                else if (!strncmp(argv[i], "-d", 2)
+                        || !strncmp(argv[i], "--domain-name", 13))
+                {
+                        if (i + 1 < argc) {
+                                resolve_dom_name(argv[++i], cfg.server_ip);
                         }
                 }
         }
+        return cfg;
+}
 
-        printf("INFO: Rendezvous server %s:%d | Local Port %d\n", server_ip, server_port, local_port);
-
-        // socket create
-        int32_t sock_fd;
-        if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-                fprintf(stderr, "ERROR: Socket creation failed.\n");
-                return 1;
-        }
-
-        // set socket option for TCP hole punch
+// Procedure for TCP Hole Punch
+void set_sockopt(int32_t sock_fd) {
         int32_t opt = 1;
         if (setsockopt(
                 sock_fd,
@@ -84,8 +88,9 @@ int main(int argc, char **argv) {
                 sizeof(opt)) < 0
         ) {
                 fprintf(stderr, "ERROR: setsockopt(SO_REUSEADDR) failed\n");
-                return 1;
+                exit(1);
         }
+
         if (setsockopt(
                 sock_fd,
                 SOL_SOCKET,
@@ -94,58 +99,73 @@ int main(int argc, char **argv) {
                 sizeof(opt)) < 0
         ) {
                 fprintf(stderr, "ERROR: setsockopt(SO_REUSEPORT) failed\n");
-                return 1;
+                exit(1);
+        }
+}
+
+int32_t make_bound_socket(const struct sockaddr_in *local_addr) {
+        int32_t fd;
+        if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+                fprintf(stderr, "ERROR: Socket creation failed.\n");
+                return -1;
         }
 
-        // bind to specific local Port
-        struct sockaddr_in local_addr = {0};
-        local_addr.sin_family           = AF_INET;
-        local_addr.sin_addr.s_addr      = htonl(INADDR_ANY);
-        local_addr.sin_port             = htons(local_port);
+        set_sockopt(fd);
 
         if (bind(
-                sock_fd,
-                (struct sockaddr*)&local_addr,
-                sizeof(local_addr)) < 0
-        ) {
+                fd,
+                (const struct sockaddr*)local_addr,
+                sizeof(*local_addr)) < 0)
+        {
                 fprintf(stderr, "ERROR: bind() failed.\n");
-                return 1;
+                return -1;
         }
 
-        // Connect to Rendezvous
+        return fd;
+}
+
+int32_t connect_to_rendezvous(
+        const Config            *cfg,
+        const struct sockaddr_in *local_addr)
+{
+        int32_t fd;
+        if ((fd = make_bound_socket(local_addr)) == -1) {
+                return -1;
+        }
+
         struct sockaddr_in server_addr = {0};
         server_addr.sin_family          = AF_INET;
-        server_addr.sin_addr.s_addr     = inet_addr(server_ip);
-        server_addr.sin_port            = htons(server_port);
+        server_addr.sin_addr.s_addr     = inet_addr(cfg->server_ip);
+        server_addr.sin_port            = htons(cfg->server_port);
 
-        printf("Connecting to Rendezvous server...\n");
+        printf("Connecting to Rendezvous Server...\n");
         if (connect(
-                sock_fd,
+                fd,
                 (struct sockaddr*)&server_addr,
-                sizeof(server_addr)) < 0
-        ) {
-                fprintf(stderr, "ERROR: Connection to Rendezvous Server failed\n");
-                return 1;
+                sizeof(server_addr)) < 0)
+        {
+                fprintf(stderr, "ERROR: Connection to Rendezvous Server failed.\n");
+                close(fd);
+                return -1;
         }
 
         printf("Connected successfully!\n");
+        return fd;
+}
 
-        char target_ip[MAX_IP_LEN] = {0};
-        uint16_t target_port = 0;
-
-        // handle communication
+bool do_rendezvous_exchange(int32_t rendezvous_fd, PeerInfo *peer) {
         char buffer[1024];
+
         for (;;) {
                 memset(buffer, 0, sizeof(buffer));
-                int32_t bytes_received;
-                if ((bytes_received = recv(
-                        sock_fd,
-                        buffer,
-                        sizeof(buffer) - 1,
-                        0)) <= 0
-                ) {
+                int32_t bytes_received = recv(
+                                rendezvous_fd,
+                                buffer,
+                                sizeof(buffer),
+                                0);
+                if (bytes_received <= 0) {
                         printf("\nConnection to Rendezvous Server closed.\n");
-                        break;
+                        return false;
                 }
 
                 // print server message
@@ -154,8 +174,8 @@ int main(int argc, char **argv) {
 
                 // server ERROR
                 if (strstr(buffer, "ERROR")) {
-                        close(sock_fd);
-                        return 1;
+                        close(rendezvous_fd);
+                        return false;
                 }
 
                 // if it asking for input
@@ -163,19 +183,43 @@ int main(int argc, char **argv) {
                         char input[0xff];
                         // get input
                         if (fgets(input, sizeof(input), stdin) != NULL) {
-                                send(sock_fd, input, strlen(input), 0);
+                                send(rendezvous_fd, input, strlen(input), 0);
                         }
                 }
 
                 // if server sent Peer IP:Port
                 // FORMAT ("IP:Port\n")
-                else if (sscanf(buffer, "%15[^:]:%hu", target_ip, &target_port) == 2) {
-                        printf("\n>>> Target Peer Acquired: %s:%d <<<\n", target_ip, target_port);
-                        break;
+                else if (sscanf(buffer, "%15[^:]:%hu", peer->ip, &peer->port) == 2) {
+                        printf("\n>>> Target Peer Acquired: %s:%d <<<\n",
+                               peer->ip, peer->port);
+                        return true;
                 }
         }
-        // Disconnect from Rendezvous
-        close(sock_fd);
+}
+
+int main(int argc, char **argv) {
+        Config cfg = parse_args(argc, argv);
+        printf("INFO: Rendezvous server %s:%d | Local Port %d\n",
+               cfg.server_ip, cfg.server_port, cfg.local_port);
+
+        // bind to specific local Port
+        struct sockaddr_in local_addr = {0};
+        local_addr.sin_family           = AF_INET;
+        local_addr.sin_addr.s_addr      = htonl(INADDR_ANY);
+        local_addr.sin_port             = htons(cfg.local_port);
+
+        int32_t rendezvous_fd = connect_to_rendezvous(&cfg, &local_addr);
+        if (rendezvous_fd == -1) {
+                return 1;
+        }
+
+        PeerInfo peer = {0};
+        bool get_peer = do_rendezvous_exchange(rendezvous_fd, &peer);
+        close(rendezvous_fd);
+
+        if (!get_peer) {
+                return 1;
+        }
 
         // Let's wait until Rendezvous connection is closed
         int32_t p2p_fd;
