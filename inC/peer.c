@@ -251,11 +251,12 @@ int main(int argc, char **argv) {
                 close(p2p_fd);
                 return 1;
         }
+        printf("Sent public key to %s:%d\n", target_ip, target_port);
 
         int32_t bytes_read = 0;
         while (bytes_read < crypto_kx_PUBLICKEYBYTES) {
                 int32_t r = 0;
-                if ((r <= recv(
+                if ((r = recv(
                         p2p_fd,
                         peer_pub_key + bytes_read,
                         crypto_kx_PUBLICKEYBYTES - bytes_read,
@@ -267,6 +268,7 @@ int main(int argc, char **argv) {
                 }
                 bytes_read += r;
         }
+        printf("Received public key from %s:%d\n", target_ip, target_port);
 
         // Deciding who is "client", who "server"
         uint8_t rx_key[crypto_kx_SECRETKEYBYTES];
