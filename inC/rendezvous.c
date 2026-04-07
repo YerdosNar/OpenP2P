@@ -96,15 +96,26 @@ void handle_joiner(
         Room rooms[],
         uint8_t room_count
 ) {
-        Room *room;
+        Room *room = NULL;
         // ask for ID to verify
         char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
         for (uint8_t i = 0; i < room_count; i++) {
-                char *r_id = rooms[i].room_id;
-                if (!strncmp(r_id, id, strlen(r_id))) {
-                        room = &rooms[i];
-                        break;
+                if (rooms[i].is_active) {
+                        char *r_id = rooms[i].room_id;
+                        if (!strncmp(r_id, id, strlen(r_id))) {
+                                room = &rooms[i];
+                                break;
+                        }
                 }
+        }
+
+        if (room == NULL) {
+                const char *err_msg = "ERROR: Room ID not found.\n";
+                send(client_fd, err_msg, strlen(err_msg), 0);
+                printf("Joiner requested non-existent room.\n");
+                free(id);
+                close(client_fd);
+                return;
         }
 
         // ask for PW to authenticate
@@ -232,16 +243,34 @@ int main(int argc, char **argv)
 
                 char *host_join = ask_n_receive("Are you [H]ost or [J]oin? [h/j]: ", client_fd);
                 if (!strncmp(host_join, "H", 1)
-                        || !strncmp(host_join, "h", 1)
-                        && count < 10)
+                        || !strncmp(host_join, "h", 1))
                 {
-                        handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
+                        bool slot_found = false;
+                        for (uint8_t i = 0; i < 10; i++) {
+                                if (!rooms[i].is_active) {
+                                        handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
+                                        slot_found = true;
+                                        break;
+                                }
+                        }
+                        if (!slot_found) {
+                                const char *full_msg = "ERROR: Server is at maximum room capacity.\n";
+                                send(client_fd, full_msg, strlen(full_msg), 0);
+                                close(client_fd);
+                        }
                 }
                 else if (!strncmp(host_join, "J", 1)
                         || !strncmp(host_join, "j", 1))
                 {
                         handle_joiner(client_fd, peer_ip, peer_port, rooms, 10);
                 }
+                else {
+                        const char *err = "ERROR: Invalid selection.\n";
+                        send(client_fd, err, strlen(err), 0);
+                        close(client_fd);
+                }
+
+                free(host_join);
         }
 
         close(server_fd);
