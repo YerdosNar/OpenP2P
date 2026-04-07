@@ -173,7 +173,66 @@ int main(int argc, char **argv) {
                         break;
                 }
         }
-
+        // Disconnect from Rendezvous
         close(sock_fd);
+
+        // Let's wait until Rendezvous connection is closed
+        int32_t p2p_fd;
+        bool connected = false;
+        struct sockaddr_in peer_addr = {0};
+        peer_addr.sin_family            = AF_INET;
+        peer_addr.sin_addr.s_addr       = inet_addr(target_ip);
+        peer_addr.sin_port              = htons(target_port);
+
+        printf("Initiating TCP Hole Punch to %s:%d...\n", target_ip, target_port);
+
+        // let's try 15 times
+        for (int i = 0; i < 15; i++) {
+                p2p_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+                setsockopt(p2p_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                setsockopt(p2p_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+                if (bind(
+                        p2p_fd,
+                        (struct sockaddr*)&local_addr,
+                        sizeof(local_addr)) < 0
+                ) {
+                        fprintf(stderr, "ERROR: P2P Bind failed.\n");
+                        close(p2p_fd);
+                        return 1;
+                }
+
+                if (connect(
+                        p2p_fd,
+                        (struct sockaddr*)&peer_addr,
+                        sizeof(peer_addr)) == 0
+                ) {
+                        connected = true;
+                        break;
+                }
+
+                close(p2p_fd);
+                printf("Punch attempt %d failed. Retrying in ...\n", i+1);
+        }
+
+        if (!connected) {
+                printf("\nERROR: TCP Hole Punch failed after 15 attempts. The NATs might be too strict.\n");
+                return 1;
+        }
+
+        printf("\n=== === === === === === === === ===\n");
+        printf("SUCCESS! P2P CONNECTION ESTABLISHED!");
+        printf("\n=== === === === === === === === ===\n");
+
+        char test_msg[64];
+        snprintf(test_msg, sizeof(test_msg), "Hello Port:%d", local_port);
+        send(p2p_fd, test_msg, strlen(test_msg), 0);
+
+        char p2p_buffer[0xff] = {0};
+        recv(p2p_fd, p2p_buffer, sizeof(p2p_buffer) - 1, 0);
+        printf("Message from peer: %s\n", p2p_buffer);
+
+        close(p2p_fd);
         return 0;
 }
