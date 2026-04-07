@@ -10,10 +10,13 @@
 #include <unistd.h>
 
 // buffer lengths
-#define MAX_ID_LEN              64
-#define MAX_PW_LEN              64
+#define MAX_ID_LEN              8
+#define MAX_PW_LEN              8
 #define MAX_IP_LEN              16
 #define MAX_ROOMS               5000
+
+// room expires after 3 minutes of waiting
+#define ROOM_TTL_SECONDS        180
 
 // default vals
 #define DEFAULT_PORT            8888
@@ -21,12 +24,12 @@
 
 typedef struct {
         char            host_ip[MAX_IP_LEN];
-        uint16_t        host_port;
-        char            room_id[MAX_ID_LEN];
         char            room_password[MAX_PW_LEN];
+        char            room_id[MAX_ID_LEN];
         time_t          creation_time;
-        bool            is_active;
         int32_t         host_fd;
+        uint16_t        host_port;
+        bool            is_active;
 } Room;
 
 void strip_newline(char *str) {
@@ -34,33 +37,23 @@ void strip_newline(char *str) {
 }
 
 // Ask and receive info from peer
-char *ask_n_receive(
-        const char      *prompt,
-        int32_t         client_fd
-) {
-        char            *buffer = calloc(0xff, sizeof(char));
-        int32_t         bytes_received;
-        char send_prompt[strlen(prompt) + 9];           // "INPUT: \0" = 7 chars
-        snprintf(send_prompt, sizeof(send_prompt) - 1, "INPUT: %s ", prompt);
+char *ask_n_receive(const char *prompt, int32_t client_fd) {
+        char *buffer = calloc(0xff, sizeof(char));
+        if (!buffer) return NULL;
 
-        send(
-                        client_fd,
-                        send_prompt,
-                        strlen(send_prompt),
-                        0);
-        bytes_received = recv(
-                        client_fd,
-                        buffer,
-                        0xff - 1,
-                        0);
+        // "INPUT: " prefix tells peer.c to read stdin
+        char send_prompt[strlen(prompt) + 9];
+        snprintf(send_prompt, sizeof(send_prompt), "INPUT: %s ", prompt);
 
+        send(client_fd, send_prompt, strlen(send_prompt), 0);
+
+        int32_t bytes_received = recv(client_fd, buffer, 0xff - 1, 0);
         if (bytes_received <= 0) {
-                fprintf(stderr,
-                        "ERROR: Disconnected during %s input.\n",
-                        send_prompt);
-                close(client_fd);
-                return "NOT FOUND";
+                fprintf(stderr, "ERROR: Disconnected during '%s' input.\n", prompt);
+                free(buffer);
+                return NULL;
         }
+
         strip_newline(buffer);
         return buffer;
 }
@@ -69,14 +62,16 @@ void handle_host(
         int32_t         client_fd,
         const char      *peer_ip,
         uint16_t        peer_port,
-        Room            *room
+        Room            rooms[],
+        uint32_t        max_rooms
 ) {
         // Ask for and receive room ID
-        char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
+        char *id = NULL;
+        ask_n_receive("Enter HostRoom ID (7 chars): ", client_fd);
         strncpy(room->room_id, id, MAX_PW_LEN - 1);
         free(id);
         // Ask and recv password;
-        char *pw = ask_n_receive("Enter HostRoom password: ", client_fd);
+        char *pw = ask_n_receive("Enter HostRoom password (7 chars): ", client_fd);
         strncpy(room->room_password, pw, MAX_ID_LEN - 1);
         free(pw);
 
@@ -93,15 +88,16 @@ void handle_host(
 }
 
 void handle_joiner(
-        int32_t client_fd,
-        const char *peer_ip,
-        uint16_t peer_port,
-        Room rooms[]
+        int32_t         client_fd,
+        const char      *peer_ip,
+        uint16_t        peer_port,
+        Room            rooms[],
+        uint32_t        max_rooms
 ) {
         Room *room = NULL;
         // ask for ID to verify
-        char *id = ask_n_receive("Enter HostRoom ID: ", client_fd);
-        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
+        char *id = ask_n_receive("Enter HostRoom ID (case sensitive): ", client_fd);
+        for (uint32_t i = 0; i < max_rooms; i++) {
                 if (rooms[i].is_active) {
                         char *r_id = rooms[i].room_id;
                         if (!strncmp(r_id, id, strlen(r_id))) {
@@ -121,7 +117,7 @@ void handle_joiner(
         }
 
         // ask for PW to authenticate
-        char *pw = ask_n_receive("Enter HostRoom password: ", client_fd);
+        char *pw = ask_n_receive("Enter HostRoom password (case sensitive): ", client_fd);
         char *r_pw = room->room_password;
         if (strncmp(pw, r_pw, strlen(r_pw))) {
                 const char *err_msg = "ERROR: Invalid password.\n";
@@ -151,9 +147,9 @@ void handle_joiner(
         room->is_active = false;
 }
 
-void count_print_available_rooms(Room rooms[]) {
+void count_print_available_rooms(Room rooms[], uint32_t max_rooms) {
         uint8_t sum = 0;
-        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
+        for (uint32_t i = 0; i < max_rooms; i++) {
                 if (!rooms[i].is_active) {
                         sum++;
                 }
@@ -201,7 +197,7 @@ int main(int argc, char **argv)
                                         printf("No filename provided. Default: 'con.log'\n");
                                 }
                         }
-                        else if (!strncmp(argv[i], "-m" 2) || !strncmp(argv[i], "--max-rooms", 11)) {
+                        else if (!strncmp(argv[i], "-m", 2) || !strncmp(argv[i], "--max-rooms", 11)) {
                                 if (i + 1 < argc) {
                                         max_rooms = atoi(argv[++i]);
                                 }
@@ -225,8 +221,7 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        // We should allow port reuse
-        // So we don't get "Address already in use" error
+        // We should allow port reuse So we don't get "Address already in use" error
         int32_t opt = 1;
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
                 fprintf(stderr, "ERROR: setsockopt() failed\n");
@@ -253,7 +248,8 @@ int main(int argc, char **argv)
 
         printf("Server successfully started and listening on port %d...\n", listen_port);
 
-        Room rooms[MAX_ROOMS] = {0};
+        Room rooms[max_rooms];
+        memset(rooms, 0, max_rooms);
         uint8_t count = 0;
         // loop
         for (;;) {
@@ -280,7 +276,7 @@ int main(int argc, char **argv)
                         || !strncmp(host_join, "h", 1))
                 {
                         bool slot_found = false;
-                        for (uint32_t i = 0; i < MAX_ROOMS; i++) {
+                        for (uint32_t i = 0; i < max_rooms; i++) {
                                 if (!rooms[i].is_active) {
                                         handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
                                         slot_found = true;
@@ -296,7 +292,7 @@ int main(int argc, char **argv)
                 else if (!strncmp(host_join, "J", 1)
                         || !strncmp(host_join, "j", 1))
                 {
-                        handle_joiner(client_fd, peer_ip, peer_port, rooms);
+                        handle_joiner(client_fd, peer_ip, peer_port, rooms, max_rooms);
                 }
                 else {
                         const char *err = "ERROR: Invalid selection.\n";
@@ -304,8 +300,8 @@ int main(int argc, char **argv)
                         close(client_fd);
                 }
 
-                count %= MAX_ROOMS;
-                count_print_available_rooms(rooms);
+                count %= max_rooms;
+                count_print_available_rooms(rooms, max_rooms);
                 free(host_join);
         }
 
