@@ -6,7 +6,7 @@ if [ "$1" == "-r" ]; then
         fi
 elif [ "$1" == "-p" ]; then
         if [[ ! -f exe_peer || peer.c -nt exe_peer ]]; then
-                gcc -o exe_peer peer.c -Wall -Wextra
+                gcc -o exe_peer peer.c -Wall -Wextra -lsodium
         fi
 elif [ "$1" == "-c" ]; then
         rm exe_*

@@ -1,4 +1,3 @@
-#include <asm-generic/socket.h>
 #include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,6 +8,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sodium.h>
 
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
@@ -225,15 +225,98 @@ int main(int argc, char **argv) {
         printf("SUCCESS! P2P CONNECTION ESTABLISHED!");
         printf("\n=== === === === === === === === ===\n");
 
-        char test_msg[64];
-        printf("Please enter your name: ");
-        fgets(test_msg, sizeof(test_msg)-1, stdin);
-        test_msg[strcspn(test_msg, "\r\n")] = 0;
-        send(p2p_fd, test_msg, strlen(test_msg), 0);
+        // Initializing E2EE with libsodium
+        if (sodium_init() < 0) {
+                fprintf(stderr, "ERROR: libsodium couldn't be initialized. Is it installed?\n");
+                close(p2p_fd);
+                return 1;
+        }
 
-        char p2p_buffer[0xff] = {0};
-        recv(p2p_fd, p2p_buffer, sizeof(p2p_buffer) - 1, 0);
-        printf("Message from peer: %s\n", p2p_buffer);
+        uint8_t my_pub_key[crypto_kx_PUBLICKEYBYTES];
+        uint8_t my_sec_key[crypto_kx_SECRETKEYBYTES];
+        crypto_kx_keypair(my_pub_key, my_sec_key);
+
+        printf("Generated local encryption keys. Trading public keys with peer...\n");
+
+        // Exchange public keys
+        uint8_t peer_pub_key[crypto_kx_PUBLICKEYBYTES];
+
+        if (send(
+                p2p_fd,
+                my_pub_key,
+                crypto_kx_PUBLICKEYBYTES,
+                0) < 0)
+        {
+                fprintf(stderr, "ERROR: Failed to send public key.\n");
+                close(p2p_fd);
+                return 1;
+        }
+
+        int32_t bytes_read = 0;
+        while (bytes_read < crypto_kx_PUBLICKEYBYTES) {
+                int32_t r = 0;
+                if ((r <= recv(
+                        p2p_fd,
+                        peer_pub_key + bytes_read,
+                        crypto_kx_PUBLICKEYBYTES - bytes_read,
+                        0)) <= 0)
+                {
+                        fprintf(stderr, "ERROR: Disconnected during key exchange.\n");
+                        close(p2p_fd);
+                        return 1;
+                }
+                bytes_read += r;
+        }
+
+        // Deciding who is "client", who "server"
+        uint8_t rx_key[crypto_kx_SECRETKEYBYTES];
+        uint8_t tx_key[crypto_kx_SECRETKEYBYTES];
+
+        int32_t cmp = memcmp(my_pub_key, peer_pub_key, crypto_kx_PUBLICKEYBYTES);
+        if (cmp == 0) {
+                fprintf(stderr, "ERROR: Public keys are identical (someone connected to themselves?)\n");
+                close(p2p_fd);
+                return 1;
+        }
+        else if (cmp < 0) {
+                if (crypto_kx_client_session_keys(
+                        rx_key,
+                        tx_key,
+                        my_pub_key,
+                        my_sec_key,
+                        peer_pub_key) != 0)
+                {
+                        fprintf(stderr, "ERROR: Client session key derivation failed.\n");
+                        return 1;
+                }
+                printf("Acting as Client for Key Derivation.\n");
+        }
+        else {
+                if (crypto_kx_client_session_keys(
+                        rx_key,
+                        tx_key,
+                        my_pub_key,
+                        my_sec_key,
+                        peer_pub_key) != 0)
+                {
+                        fprintf(stderr, "ERROR: Server session key derivation failed.\n");
+                        return 1;
+                }
+                printf("Acting as Server for Key Derivation.\n");
+        }
+
+        printf("SUCESS: E2EE Session Keys generated.\n");
+        sodium_memzero(my_sec_key, sizeof(my_sec_key));
+
+        char my_name[64];
+        printf("Please enter your name: ");
+        fgets(my_name, sizeof(my_name)-1, stdin);
+        my_name[strcspn(my_name, "\r\n")] = 0;
+        send(p2p_fd, my_name, strlen(my_name), 0);
+
+        char peer_name[64];
+        recv(p2p_fd, peer_name, sizeof(peer_name) - 1, 0);
+        printf("Message from peer: %s\n", peer_name);
 
         close(p2p_fd);
         return 0;
