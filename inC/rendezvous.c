@@ -49,6 +49,8 @@ void usage(const char *exe_file) {
 }
 
 // Ask and receive info from peer.
+// Returns heap-allocated string on success, NULL on disconnect.
+// Caller must free() the returned pointer.
 char *ask_n_receive(const char *prompt, int32_t client_fd) {
         char *buffer = calloc(0xff, sizeof(char));
         if (!buffer) return NULL;
@@ -82,6 +84,7 @@ int32_t find_free_slot(Room rooms[], uint32_t max_rooms) {
 Room *find_room_by_id(Room rooms[], uint32_t max_rooms, const char *id) {
         for (uint32_t i = 0; i < max_rooms; i++) {
                 if (!rooms[i].is_active) continue;
+                // stored id length used to guard against prefix matches
                 if (!strncmp(rooms[i].room_id, id, MAX_ID_LEN)) return &rooms[i];
         }
         return NULL;
@@ -92,6 +95,8 @@ bool room_id_exists(Room rooms[], uint32_t max_rooms, const char *id) {
         return find_room_by_id(rooms, max_rooms, id) != NULL;
 }
 
+// Scans all slots and expires any room older than ROOM_TTL_SECONDS.
+// Closes the waiting host's fd so they get a clean disconnect.
 void expire_stale_rooms(Room rooms[], uint32_t max_rooms) {
         time_t now = time(NULL);
         for (uint32_t i = 0; i < max_rooms; i++) {
@@ -134,6 +139,7 @@ void handle_host(
                         free(id);
                         continue;
                 }
+
                 if (room_id_exists(rooms, max_rooms, id)) {
                         const char *msg = "INPUT: That ID is already in use. Choose another: ";
                         send(client_fd, msg, strlen(msg), 0);
@@ -151,6 +157,16 @@ void handle_host(
         }
 
         int32_t slot = find_free_slot(rooms, max_rooms);
+        if (slot == -1) {
+                // shouldn't happen (checked before calling), but guard anyway
+                const char *msg = "ERROR: Server is at maximum room capacity.\n";
+                send(client_fd, msg, strlen(msg), 0);
+                free(id);
+                free(pw);
+                close(client_fd);
+                return;
+        }
+
         Room *room = &rooms[slot];
         strncpy(room->room_id,          id,     MAX_ID_LEN - 1);
         strncpy(room->room_password,    pw,     MAX_PW_LEN - 1);
@@ -177,54 +193,50 @@ void handle_joiner(
         Room            rooms[],
         uint32_t        max_rooms
 ) {
-        Room *room = NULL;
         // ask for ID to verify
-        char *id = ask_n_receive("Enter HostRoom ID (case sensitive): ", client_fd);
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (rooms[i].is_active) {
-                        char *r_id = rooms[i].room_id;
-                        if (!strncmp(r_id, id, strlen(r_id))) {
-                                room = &rooms[i];
-                                break;
-                        }
-                }
-        }
+        char *id = ask_n_receive("HostRoom ID (case sensitive): ", client_fd);
+        if (!id) return;
 
-        if (room == NULL) {
-                const char *err_msg = "ERROR: Room ID not found.\n";
-                send(client_fd, err_msg, strlen(err_msg), 0);
+        Room *room = find_room_by_id(rooms, max_rooms, id);
+        free(id);
+
+        if (!room) {
+                const char *msg = "ERROR: Room ID not found.\n";
+                send(client_fd, msg, strlen(msg), 0);
                 printf("Joiner requested non-existent room.\n");
-                free(id);
                 close(client_fd);
                 return;
         }
 
-        // ask for PW to authenticate
-        char *pw = ask_n_receive("Enter HostRoom password (case sensitive): ", client_fd);
-        char *r_pw = room->room_password;
-        if (strncmp(pw, r_pw, strlen(r_pw))) {
-                const char *err_msg = "ERROR: Invalid password.\n";
-                send(client_fd, err_msg, strlen(err_msg), 0);
-                printf("Joiner provided wrong Room password.\n");
+        // Ask for password
+        char *pw = ask_n_receive("HostRoom password (case sensitive): ", client_fd);
+        if (!pw) {
                 close(client_fd);
                 return;
         }
 
-        // If everything is correct
-        printf("Credentials matched! Exchanging IP:Port\n");
+        if (strncmp(pw, room->room_password, MAX_PW_LEN)) {
+                const char *msg = "ERROR: Invalid password.\n";
+                send(client_fd, msg, strlen(msg), 0);
+                printf("Joiner provided wrong password for room '%s'.\n", room->room_id);
+                free(pw);
+                close(client_fd);
+                return;
+        }
+        free(pw);
+
+        printf("Credentials matched! Exchanging IP:Port for room '%s'.\n", room->room_id);
 
         char msg_to_host[0xff];
         char msg_to_join[0xff];
-
         snprintf(msg_to_host, sizeof(msg_to_host), "%s:%d\n", peer_ip, peer_port);
         snprintf(msg_to_join, sizeof(msg_to_join), "%s:%d\n", room->host_ip, room->host_port);
 
         send(room->host_fd, msg_to_host, strlen(msg_to_host), 0);
-        send(client_fd, msg_to_join, strlen(msg_to_join), 0);
+        send(client_fd,     msg_to_join, strlen(msg_to_join), 0);
 
-        printf("Handshake completed! Tearing down rendezvous...\n");
-        free(id);
-        free(pw);
+        printf("Handshake complete! Tearing down rendezvous for room '%s'.\n", room->room_id);
+
         close(room->host_fd);
         close(client_fd);
         room->is_active = false;
@@ -250,20 +262,12 @@ int main(int argc, char **argv)
                                 }
                         }
                         else if (!strncmp(argv[i], "-l", 2) || !strncmp(argv[i], "--log", 5)) {
-                                if (i + 1 < argc) {
-                                        log_filename = argv[++i];
-                                }
-                                else {
-                                        printf("No filename provided. Default: 'con.log'\n");
-                                }
+                                if (i + 1 < argc) log_filename = argv[++i];
+                                else printf("No filename provided. Default: 'con.log'\n");
                         }
                         else if (!strncmp(argv[i], "-m", 2) || !strncmp(argv[i], "--max-rooms", 11)) {
-                                if (i + 1 < argc) {
-                                        max_rooms = atoi(argv[++i]);
-                                }
-                                else {
-                                        printf("No number provided. Default: 5000\n");
-                                }
+                                if (i + 1 < argc) max_rooms = atoi(argv[++i]);
+                                else printf("No number provided. Default: 5000\n");
                         }
                         else if (!strncmp(argv[i], "-h", 2) || !strncmp(argv[i], "--help", 6)) {
                                 usage(argv[0]);
@@ -351,14 +355,12 @@ int main(int argc, char **argv)
                                 handle_host(client_fd, peer_ip, peer_port, rooms, max_rooms);
                         }
                 }
-                else if (!strncmp(choice, "J", 1)
-                        || !strncmp(choice, "j", 1))
-                {
+                else if (!strncmp(choice, "J", 1) || !strncmp(choice, "j", 1)) {
                         handle_joiner(client_fd, peer_ip, peer_port, rooms, max_rooms);
                 }
                 else {
-                        const char *err = "ERROR: Invalid selection.\n";
-                        send(client_fd, err, strlen(err), 0);
+                        const char *msg = "ERROR: Invalid selection.\n";
+                        send(client_fd, msg, strlen(msg), 0);
                         close(client_fd);
                 }
 
