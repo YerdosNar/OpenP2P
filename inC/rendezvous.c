@@ -36,7 +36,19 @@ void strip_newline(char *str) {
         str[strcspn(str, "\r\n")] = 0;
 }
 
-// Ask and receive info from peer
+void usage(const char *exe_file) {
+        printf("Usage: %s [options]\n\n", exe_file);
+        printf("Options:\n");
+        printf("        -p, --port <port num>           Set port number to listen (default=8888)\n");
+        printf("        -l, --log <filename>            Set logging filename     (default='con.log')\n");
+        printf("        -m, --max-rooms <number>        Set max rooms in queue   (default=5000)\n");
+        printf("        -h, --help                      Show this help message\n\n");
+        printf("Example:\n");
+        printf("        %s -p 2222 -l server.log\n", exe_file);
+        exit(1);
+}
+
+// Ask and receive info from peer.
 char *ask_n_receive(const char *prompt, int32_t client_fd) {
         char *buffer = calloc(0xff, sizeof(char));
         if (!buffer) return NULL;
@@ -58,6 +70,51 @@ char *ask_n_receive(const char *prompt, int32_t client_fd) {
         return buffer;
 }
 
+// Returns the first free (inactive) slot index, or -1 if full.
+int32_t find_free_slot(Room rooms[], uint32_t max_rooms) {
+        for (uint32_t i = 0; i < max_rooms; i++) {
+                if (!rooms[i].is_active) return (int32_t)i;
+        }
+        return -1;
+}
+
+// Returns pointer to an active room matching id, or NULL if not found.
+Room *find_room_by_id(Room rooms[], uint32_t max_rooms, const char *id) {
+        for (uint32_t i = 0; i < max_rooms; i++) {
+                if (!rooms[i].is_active) continue;
+                if (!strncmp(rooms[i].room_id, id, MAX_ID_LEN)) return &rooms[i];
+        }
+        return NULL;
+}
+
+// Returns true if id is already taken by an active room.
+bool room_id_exists(Room rooms[], uint32_t max_rooms, const char *id) {
+        return find_room_by_id(rooms, max_rooms, id) != NULL;
+}
+
+void expire_stale_rooms(Room rooms[], uint32_t max_rooms) {
+        time_t now = time(NULL);
+        for (uint32_t i = 0; i < max_rooms; i++) {
+                if (!rooms[i].is_active) continue; // No need to touch inactive rooms
+                if (difftime(now, rooms[i].creation_time) > ROOM_TTL_SECONDS) {
+                        printf("NOTICE: Room '%s' expired (>%ds). Closing host fd.\n",
+                               rooms[i].room_id, ROOM_TTL_SECONDS);
+                        const char *msg = "ERROR: Room expired. No peer joined in time.\n";
+                        send(rooms[i].host_fd, msg, strlen(msg), 0);
+                        close(rooms[i].host_fd);
+                        rooms[i].is_active = false;
+                }
+        }
+}
+
+void print_room_stats(Room rooms[], uint32_t max_rooms) {
+        uint32_t active = 0;
+        for (uint32_t i = 0; i < max_rooms; i++) {
+                if (rooms[i].is_active) active++;
+        }
+        printf("INFO: Active rooms: %u / %u\n", active, max_rooms);
+}
+
 void handle_host(
         int32_t         client_fd,
         const char      *peer_ip,
@@ -65,26 +122,52 @@ void handle_host(
         Room            rooms[],
         uint32_t        max_rooms
 ) {
-        // Ask for and receive room ID
+        // Ask for room ID - retry until a non-duplicate is given
         char *id = NULL;
-        ask_n_receive("Enter HostRoom ID (7 chars): ", client_fd);
-        strncpy(room->room_id, id, MAX_PW_LEN - 1);
-        free(id);
-        // Ask and recv password;
-        char *pw = ask_n_receive("Enter HostRoom password (7 chars): ", client_fd);
-        strncpy(room->room_password, pw, MAX_ID_LEN - 1);
-        free(pw);
+        for (;;) {
+                id = ask_n_receive("HostRoom ID (7 chars): ", client_fd);
+                if (!id) return; // peer disconnected
 
-        strncpy(room->host_ip, peer_ip, MAX_IP_LEN - 1);
+                if (strlen(id) == 0) {
+                        const char *msg = "INPUT: ID cannot be empty. Try again: ";
+                        send(client_fd, msg, strlen(msg), 0);
+                        free(id);
+                        continue;
+                }
+                if (room_id_exists(rooms, max_rooms, id)) {
+                        const char *msg = "INPUT: That ID is already in use. Choose another: ";
+                        send(client_fd, msg, strlen(msg), 0);
+                        free(id);
+                        continue;
+                }
+
+                break; // Unique non-empty ID found
+        }
+
+        char *pw = ask_n_receive("HostRoom password (7 chars): ", client_fd);
+        if (!pw) {
+                free(id);
+                return;
+        }
+
+        int32_t slot = find_free_slot(rooms, max_rooms);
+        Room *room = &rooms[slot];
+        strncpy(room->room_id,          id,     MAX_ID_LEN - 1);
+        strncpy(room->room_password,    pw,     MAX_PW_LEN - 1);
+        strncpy(room->host_ip,          peer_ip,MAX_IP_LEN - 1);
         room->host_port         = peer_port;
         room->host_fd           = client_fd;
         room->creation_time     = time(NULL);
         room->is_active         = true;
 
-        printf("Host successfully registered. Room ID: '%s'. Waiting for Peer2...\n", room->room_id);
+        free(id);
+        free(pw);
 
-        const char *success_msg = "Room created successfully. Waiting for peer to join...\n";
-        send(client_fd, success_msg, strlen(success_msg), 0);
+        printf("Host registered in slot %d. Room ID: '%s'. Waiting for peer...\n",
+               slot, room->room_id);
+
+        const char *ok_msg = "Room created. Waiting for peer to join...\n";
+        send(client_fd, ok_msg, strlen(ok_msg), 0);
 }
 
 void handle_joiner(
@@ -147,34 +230,11 @@ void handle_joiner(
         room->is_active = false;
 }
 
-void count_print_available_rooms(Room rooms[], uint32_t max_rooms) {
-        uint8_t sum = 0;
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (!rooms[i].is_active) {
-                        sum++;
-                }
-        }
-
-        printf("INFO: Number of available rooms: %u\n", sum);
-}
-
-void usage(const char *exe_file) {
-        printf("Usage: %s [options]\n\n", exe_file);
-        printf("Options:\n");
-        printf("        -p, --port <port num>           Set port number to listen (default=8888)\n");
-        printf("        -l, --log <filename>            Set logging filename (default='con.log')\n");
-        printf("        -m, --max-rooms <number>        Set max room number in queue (default=5000)\n");
-        printf("        -h, --help                      Show this help message\n\n");
-        printf("Example:\n");
-        printf("        %s -p 2222 -l logging\n", exe_file);
-        exit(1);
-}
-
 int main(int argc, char **argv)
 {
-        uint16_t listen_port = DEFAULT_PORT;
-        char *log_filename = DEFAULT_LOG_FILE;
-        uint32_t max_rooms = MAX_ROOMS;
+        uint16_t listen_port  = DEFAULT_PORT;
+        char    *log_filename = DEFAULT_LOG_FILE;
+        uint32_t max_rooms    = MAX_ROOMS;
 
         // cmd arg parsing
         if (argc >= 2) {
@@ -206,16 +266,15 @@ int main(int argc, char **argv)
                                 }
                         }
                         else if (!strncmp(argv[i], "-h", 2) || !strncmp(argv[i], "--help", 6)) {
-                                usage(argv[i]);
+                                usage(argv[0]);
                         }
                 }
         }
-        printf("INFO: Port: %d, Logfile: %s\n", listen_port, log_filename);
+        printf("INFO: Port: %d, Logfile: %s, Max rooms: %u\n",
+               listen_port, log_filename, max_rooms);
 
         // Setup server socket
         int32_t server_fd;
-
-        // Create socket (IPv4, TCP)
         if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
                 fprintf(stderr, "ERROR: Socket creation failed\n");
                 return 1;
@@ -246,51 +305,54 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        printf("Server successfully started and listening on port %d...\n", listen_port);
+        printf("Server listening on port %d...\n", listen_port);
 
-        Room rooms[max_rooms];
-        memset(rooms, 0, max_rooms);
-        uint8_t count = 0;
-        // loop
+        Room *rooms = calloc(max_rooms, sizeof(Room));
+        if (!rooms) {
+                fprintf(stderr, "ERROR: Failed to calloc() room table (%u rooms)\n", max_rooms);
+                close(server_fd);
+                return 1;
+        }
+
         for (;;) {
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
 
                 int32_t client_fd = accept(
-                                server_fd,
-                                (struct sockaddr *)&client_addr,
-                                &client_len);
+                        server_fd,
+                        (struct sockaddr *)&client_addr,
+                        &client_len);
                 if (client_fd == -1) {
-                        fprintf(stderr, "ERROR: Warning: Accept failed\n");
-                        continue; // We will not crash, we just skip this one
+                        fprintf(stderr, "WARNING: accept() failed, skipping.\n");
+                        continue; // We will not crash, we just skip
                 }
 
                 // Extract peer's IP:Port
                 char *peer_ip           = inet_ntoa(client_addr.sin_addr);
                 uint16_t peer_port      = ntohs(client_addr.sin_port);
-                printf("\n--- New Connection ---\n");
-                printf("Peer connected from %s:%d\n", peer_ip, peer_port);
+                printf("\n--- New Connection from %s:%d ---\n", peer_ip, peer_port);
 
-                char *host_join = ask_n_receive("Are you [H]ost or [J]oin? [h/j]: ", client_fd);
-                if (!strncmp(host_join, "H", 1)
-                        || !strncmp(host_join, "h", 1))
-                {
-                        bool slot_found = false;
-                        for (uint32_t i = 0; i < max_rooms; i++) {
-                                if (!rooms[i].is_active) {
-                                        handle_host(client_fd, peer_ip, peer_port, &rooms[count++]);
-                                        slot_found = true;
-                                        break;
-                                }
-                        }
-                        if (!slot_found) {
-                                const char *full_msg = "ERROR: Server is at maximum room capacity.\n";
-                                send(client_fd, full_msg, strlen(full_msg), 0);
+                // expire stale rooms on every new connection
+                expire_stale_rooms(rooms, max_rooms);
+
+                char *choice = ask_n_receive("Are you [H]ost or [J]oin? [h/j]: ", client_fd);
+                if (!choice) {
+                        fprintf(stderr, "WARNING: Peer disconnected before answering, skipping...\n");
+                        continue;
+                }
+
+                if (!strncmp(choice, "H", 1) || !strncmp(choice, "h", 1)) {
+                        if (find_free_slot(rooms, max_rooms) == -1) {
+                                const char *msg = "ERROR: Server is at maximum room capacity.\n";
+                                send(client_fd, msg, strlen(msg), 0);
                                 close(client_fd);
                         }
+                        else {
+                                handle_host(client_fd, peer_ip, peer_port, rooms, max_rooms);
+                        }
                 }
-                else if (!strncmp(host_join, "J", 1)
-                        || !strncmp(host_join, "j", 1))
+                else if (!strncmp(choice, "J", 1)
+                        || !strncmp(choice, "j", 1))
                 {
                         handle_joiner(client_fd, peer_ip, peer_port, rooms, max_rooms);
                 }
@@ -300,11 +362,11 @@ int main(int argc, char **argv)
                         close(client_fd);
                 }
 
-                count %= max_rooms;
-                count_print_available_rooms(rooms, max_rooms);
-                free(host_join);
+                free(choice);
+                print_room_stats(rooms, max_rooms);
         }
 
+        free(rooms);
         close(server_fd);
         return 0;
 }
