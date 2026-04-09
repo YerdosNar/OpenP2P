@@ -12,9 +12,12 @@
  * Key exchange  : X25519  via crypto_kx_*
  * Encryption    : XChaCha20-Poly1305-IETF via crypto_aead_xchacha20poly1305_ietf_*
  *
- * Wire packet format (produced by encrypt_and_send, consumed by recv_and_decrypt):
+ * Wire packet format (produced by `encrypt_and_send`,
+ *                     consumed by `recv_and_decrypt`):
  *
- *   [ nonce (NPUBBYTES=24) | plaintext_len (4 bytes, network order) | ciphertext+MAC ]
+ *   [ nonce (NPUBBYTES=24)                   ]
+ *   [ plaintext_len (4 bytes, network order) ]
+ *   [ ciphertext+MAC                         ]
  *
  * The MAC (ABYTES=16) is appended by libsodium inside the ciphertext buffer.
  */
