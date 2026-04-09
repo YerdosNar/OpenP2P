@@ -13,45 +13,52 @@
 #include "../include/crypto.h"
 #include "../include/net.h"
 
-// default values
+/* ── defaults ────────────────────────────────────────────────────────────── */
+
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
 #define MAX_IP_LEN              16
 
-// types
+/* ── types ───────────────────────────────────────────────────────────────── */
+
 typedef struct {
-        char            server_ip[MAX_IP_LEN];
-        uint16_t        server_port;
-        uint16_t        local_port;
+        char     server_ip[MAX_IP_LEN];
+        uint16_t server_port;
+        uint16_t local_port;
 } Config;
 
 typedef struct {
-        char            ip[MAX_IP_LEN];
-        uint16_t        port;
+        char     ip[MAX_IP_LEN];
+        uint16_t port;
 } PeerInfo;
 
-void resolve_dom_name(const char *domain_name, char *out_ip) {
-        struct hostent *h = gethostbyname(domain_name);
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+
+static void resolve_domain(const char *domain, char *out_ip)
+{
+        struct hostent *h = gethostbyname(domain);
         if (h) {
                 char *ip = inet_ntoa(*(struct in_addr *)h->h_addr_list[0]);
                 strncpy(out_ip, ip, MAX_IP_LEN - 1);
         }
 }
 
-void usage(const char *exe_file) {
-        printf("Usage: %s [options]\n\n", exe_file);
+static void usage(const char *exe)
+{
+        printf("Usage: %s [options]\n\n", exe);
         printf("Options:\n");
-        printf("        -s, --server-port <port num>            Server port number      (default=%d)\n", DEFAULT_SERVER_PORT);
-        printf("        -i, --ip <ip>                           Server IP address       (default=127.0.0.1)\n");
-        printf("        -l, --local-port <port num>             Set local port number   (default=%d)\n", DEFAULT_LOCAL_PORT);
-        printf("        -d, --domain-name <dom name>            Server domain name\n");
-        printf("        -h, --help                              Show this help message\n");
-        printf("\n");
-        printf("Example:\n");
-        printf("        %s -d example.com -s 8888\n", exe_file);
+        printf("  -s, --server-port <port>    Rendezvous server port  (default=%d)\n",
+               DEFAULT_SERVER_PORT);
+        printf("  -i, --ip <ip>               Rendezvous server IP    (default=127.0.0.1)\n");
+        printf("  -l, --local-port <port>     Local port for P2P      (default=%d)\n",
+               DEFAULT_LOCAL_PORT);
+        printf("  -d, --domain-name <name>    Rendezvous server domain\n");
+        printf("  -h, --help                  Show this help message\n\n");
+        printf("Example:\n  %s -d example.com -s 8888\n", exe);
 }
 
-static Config parse_args(int argc, char **argv) {
+static Config parse_args(int argc, char **argv)
+{
         Config cfg;
         strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
         cfg.server_port = DEFAULT_SERVER_PORT;
@@ -59,27 +66,31 @@ static Config parse_args(int argc, char **argv) {
 
         for (int i = 1; i < argc; i++) {
                 if (!strncmp(argv[i], "-s", 2)
-                        || !strncmp(argv[i], "--server-port", 13))
+                    || !strncmp(argv[i], "--server-port", 13))
                 {
-                        if (i + 1 < argc) cfg.server_port = (uint16_t)atoi(argv[++i]);
+                        if (i + 1 < argc)
+                                cfg.server_port = (uint16_t)atoi(argv[++i]);
                 }
                 else if (!strncmp(argv[i], "-i", 2)
-                        || !strncmp(argv[i], "--ip", 4))
+                         || !strncmp(argv[i], "--ip", 4))
                 {
-                        if (i + 1 < argc) strncpy(cfg.server_ip, argv[++i], MAX_IP_LEN - 1);
+                        if (i + 1 < argc)
+                                strncpy(cfg.server_ip, argv[++i], MAX_IP_LEN - 1);
                 }
                 else if (!strncmp(argv[i], "-l", 2)
-                        || !strncmp(argv[i], "--local-port", 12))
+                         || !strncmp(argv[i], "--local-port", 12))
                 {
-                        if (i + 1 < argc) cfg.local_port = (uint16_t)atoi(argv[++i]);
+                        if (i + 1 < argc)
+                                cfg.local_port = (uint16_t)atoi(argv[++i]);
                 }
                 else if (!strncmp(argv[i], "-d", 2)
-                        || !strncmp(argv[i], "--domain-name", 13))
+                         || !strncmp(argv[i], "--domain-name", 13))
                 {
-                        if (i + 1 < argc) resolve_dom_name(argv[++i], cfg.server_ip);
+                        if (i + 1 < argc)
+                                resolve_domain(argv[++i], cfg.server_ip);
                 }
                 else if (!strncmp(argv[i], "-h", 2)
-                        || !strncmp(argv[i], "--help", 6))
+                         || !strncmp(argv[i], "--help", 6))
                 {
                         usage(argv[0]);
                         exit(1);
@@ -87,6 +98,8 @@ static Config parse_args(int argc, char **argv) {
         }
         return cfg;
 }
+
+/* ── connect to rendezvous ───────────────────────────────────────────────── */
 
 static int32_t connect_to_rendezvous(
         const Config            *cfg,
@@ -100,18 +113,20 @@ static int32_t connect_to_rendezvous(
         sa.sin_addr.s_addr     = inet_addr(cfg->server_ip);
         sa.sin_port            = htons(cfg->server_port);
 
-        printf("Connecting to Rendezvous Server %s:%d...\n",
+        printf("Connecting to rendezvous server %s:%d ...\n",
                cfg->server_ip, cfg->server_port);
 
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                fprintf(stderr, "ERROR: Connection to Rendezvous Server failed.\n");
+                fprintf(stderr, "ERROR: Connection to rendezvous server failed.\n");
                 close(fd);
                 return -1;
         }
 
-        printf("Connected successfully!\n");
+        printf("Connected.\n");
         return fd;
 }
+
+/* ── rendezvous exchange (now encrypted) ─────────────────────────────────── */
 
 /*
  * All traffic with the rendezvous server is now E2EE:
@@ -140,6 +155,7 @@ static bool do_rendezvous_exchange(
                 }
 
                 if (strstr(msg, "INPUT: ")) {
+                        /* read one line from stdin and send it back, encrypted */
                         char input[256];
                         if (fgets(input, sizeof(input), stdin) != NULL) {
                                 if (!crypto_encrypt_send(rendezvous_fd, input, s)) {
@@ -148,7 +164,7 @@ static bool do_rendezvous_exchange(
                                 }
                         }
                 }
-
+                /* IP:Port reply — format "A.B.C.D:PORT\n" */
                 else if (sscanf(msg, "%15[^:]:%hu", peer->ip, &peer->port) == 2) {
                         printf("\n>>> Target peer: %s:%d <<<\n",
                                peer->ip, peer->port);
@@ -159,6 +175,8 @@ static bool do_rendezvous_exchange(
                 free(msg);
         }
 }
+
+/* ── TCP hole punch ──────────────────────────────────────────────────────── */
 
 static int32_t do_hole_punch(
         const PeerInfo           *peer,
@@ -177,7 +195,8 @@ static int32_t do_hole_punch(
                 int32_t fd = net_make_bound_socket(local_addr);
                 if (fd == -1) return -1;
 
-                if (connect(fd, (struct sockaddr *)&pa, sizeof(pa)) == 0) return fd;
+                if (connect(fd, (struct sockaddr *)&pa, sizeof(pa)) == 0)
+                        return fd;
 
                 close(fd);
                 printf("Punch attempt %d failed. Retrying in 1s...\n", i + 1);
@@ -187,7 +206,10 @@ static int32_t do_hole_punch(
         return -1;
 }
 
-int main(int argc, char **argv) {
+/* ── main ─────────────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
         Config cfg = parse_args(argc, argv);
         printf("INFO: Rendezvous %s:%d | Local port %d\n",
                cfg.server_ip, cfg.server_port, cfg.local_port);
@@ -202,11 +224,11 @@ int main(int argc, char **argv) {
         local_addr.sin_addr.s_addr     = htonl(INADDR_ANY);
         local_addr.sin_port            = htons(cfg.local_port);
 
-        // connect to rendezvous and establish E2EE
+        /* ── connect & establish E2EE with rendezvous server ── */
         int32_t rendezvous_fd = connect_to_rendezvous(&cfg, &local_addr);
         if (rendezvous_fd == -1) return 1;
 
-        Session rs = {0};
+        Session rs = {0};   /* rendezvous session keys */
         if (!crypto_do_key_exchange(rendezvous_fd, &rs)) {
                 fprintf(stderr, "ERROR: Key exchange with rendezvous failed.\n");
                 close(rendezvous_fd);
@@ -214,16 +236,17 @@ int main(int argc, char **argv) {
         }
         printf("Secure channel with rendezvous established.\n");
 
+        /* ── exchange room credentials over encrypted channel ── */
+        PeerInfo peer    = {0};
+        bool     got_peer = do_rendezvous_exchange(rendezvous_fd, &rs, &peer);
 
-        PeerInfo peer = {0};
-        bool got_peer = do_rendezvous_exchange(rendezvous_fd, &rs, &peer);
-
-        // zero rendezvous session keys
+        /* zero rendezvous session keys — no longer needed */
         sodium_memzero(&rs, sizeof(rs));
         close(rendezvous_fd);
 
         if (!got_peer) return 1;
 
+        /* ── TCP hole punch ── */
         int32_t p2p_fd = do_hole_punch(&peer, &local_addr, 15);
         if (p2p_fd == -1) {
                 fprintf(stderr,
@@ -233,17 +256,17 @@ int main(int argc, char **argv) {
         }
 
         printf("\n=== === === === === === === === ===\n");
-        printf("SUCCESS! P2P CONNECTION ESTABLISHED!");
+        printf("  SUCCESS! P2P CONNECTION ESTABLISHED!");
         printf("\n=== === === === === === === === ===\n\n");
 
-        // Initializing E2EE with libsodium
-        Session ps = {0};
+        /* ── E2EE key exchange with the actual peer ── */
+        Session ps = {0};   /* peer-to-peer session keys */
         if (!crypto_do_key_exchange(p2p_fd, &ps)) {
                 close(p2p_fd);
                 return 1;
         }
 
-        // Share the name
+        /* ── demo: exchange names over encrypted P2P channel ── */
         char my_name[64];
         printf("Enter your name: ");
         fflush(stdout);
@@ -265,8 +288,8 @@ int main(int argc, char **argv) {
         }
 
         printf("\n=== === === === === === === === ===\n");
-        printf("  Peer says their name is: %s", peer_name);
-        printf("\n=== === === === === === === === ===\n\n");
+        printf("  Peer says their name is: %s\n", peer_name);
+        printf("=== === === === === === === === ===\n");
 
         free(peer_name);
         sodium_memzero(&ps, sizeof(ps));

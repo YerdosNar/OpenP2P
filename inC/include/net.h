@@ -10,22 +10,19 @@
 /*
  * net.h / net.c
  *
- * socket helper shared by peer and rendezvous.
+ * Low-level socket helpers shared by peer and rendezvous.
  */
 
 /*
  * Receive exactly 'len' bytes into 'buf', looping until done.
- *
- * Returns false on disconnec or error.
+ * Returns false on disconnect or error.
  */
 bool net_recv_all(int32_t fd, void *buf, size_t len);
 
 /*
- * Create a TCP socket bound to *local_addr*
- * with SO_REUSEADDR + SO_REUSPORT.
- *
- * Returns the fd on success, or -1 on failure
+ * Create a TCP socket bound to *local_addr with SO_REUSEADDR + SO_REUSEPORT.
+ * Returns the fd on success, or -1 on failure.
  */
 int32_t net_make_bound_socket(const struct sockaddr_in *local_addr);
 
-#endif
+#endif /* NET_H */
