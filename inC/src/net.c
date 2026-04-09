@@ -4,7 +4,10 @@
 #include <stdio.h>
 #include <unistd.h>
 
-bool net_recv_all(int32_t fd, void *buf, size_t len) {
+/* ── recv_all ────────────────────────────────────────────────────────────── */
+
+bool net_recv_all(int32_t fd, void *buf, size_t len)
+{
         size_t total = 0;
         while (total < len) {
                 int32_t r = recv(fd, (uint8_t *)buf + total, len - total, 0);
@@ -14,8 +17,10 @@ bool net_recv_all(int32_t fd, void *buf, size_t len) {
         return true;
 }
 
-// make bound socket
-int32_t net_make_bound_socket(const struct sockaddr_in *local_addr) {
+/* ── make_bound_socket ───────────────────────────────────────────────────── */
+
+int32_t net_make_bound_socket(const struct sockaddr_in *local_addr)
+{
         int32_t fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd == -1) {
                 fprintf(stderr, "ERROR: socket() failed.\n");

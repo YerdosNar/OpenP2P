@@ -12,40 +12,44 @@
 #include "../include/crypto.h"
 #include "../include/room.h"
 
-#define DEFAULT_PORT            8888
-#define DEFAULT_LOG_FILE        "con.log"
+/* ── defaults ────────────────────────────────────────────────────────────── */
+
+#define DEFAULT_PORT        8888
+#define DEFAULT_LOG_FILE    "con.log"
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
 
 static void strip_newline(char *str)
 {
         str[strcspn(str, "\r\n")] = 0;
 }
 
-static void usage(const char *exe_file)
+static void usage(const char *exe)
 {
-        printf("Usage: %s [options]\n\n", exe_file);
+        printf("Usage: %s [options]\n\n", exe);
         printf("Options:\n");
-        printf("        -p, --port <port num>           Set port number to listen (default=%d)\n",
+        printf("  -p, --port <port>        Listening port          (default=%d)\n",
                DEFAULT_PORT);
-        printf("        -l, --log <filename>            Set logging filename     (default='%s')\n",
+        printf("  -l, --log <file>         Log filename            (default=%s)\n",
                DEFAULT_LOG_FILE);
-        printf("        -m, --max-rooms <number>        Set max rooms in queue   (default=%d)\n",
+        printf("  -m, --max-rooms <n>      Max rooms in queue      (default=%d)\n",
                MAX_ROOMS);
-        printf("        -h, --help                      Show this help message\n\n");
-        printf("Example:\n");
-        printf("        %s -p 2222 -l server.log\n", exe_file);
-        exit(0);
+        printf("  -h, --help               Show this help message\n\n");
+        printf("Example:\n  %s -p 2222 -l server.log\n", exe);
+        exit(1);
 }
 
 /*
  * Send a prompt to the client over an encrypted session, then receive
- * the response. The "INPUT: " prefix tells peer.c to read from stdin.
+ * the response.  The "INPUT: " prefix tells peer.c to read from stdin.
  *
- * Returns a heap-allocated, NULL-terminated string on success.
- * Returns NULL on disconnect or error. Caller must free().
+ * Returns a heap-allocated, NUL-terminated string on success.
+ * Returns NULL on disconnect or error.  Caller must free().
  */
 static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
 {
-        size_t send_len = strlen(prompt) + 9;
+        /* build "INPUT: <prompt>" */
+        size_t send_len = strlen(prompt) + 9;   /* "INPUT: " + space + NUL */
         char  *tagged   = malloc(send_len);
         if (!tagged) return NULL;
         snprintf(tagged, send_len, "INPUT: %s ", prompt);
@@ -62,19 +66,30 @@ static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
         strip_newline(response);
         return response;
 }
+
+/*
+ * Send a plain status/error message to the client over the encrypted channel.
+ */
+static bool send_msg(int32_t fd, const char *msg, const Session *s)
+{
+        return crypto_encrypt_send(fd, msg, s);
+}
+
+/* ── handle_host ─────────────────────────────────────────────────────────── */
+
 static void handle_host(
-        int32_t         client_fd,
+        int32_t          client_fd,
         const char      *peer_ip,
-        uint16_t        peer_port,
-        Room            rooms[],
-        uint32_t        max_rooms,
+        uint16_t         peer_port,
+        Room             rooms[],
+        uint32_t         max_rooms,
         const Session   *s)
 {
-        // Ask for room ID - retry until a non-duplicate is given
+        /* Ask for a unique, non-empty room ID */
         char *id = NULL;
         for (;;) {
                 id = ask_n_receive("HostRoom ID (7 chars): ", client_fd, s);
-                if (!id) return; // peer disconnected
+                if (!id) return;
 
                 if (strlen(id) == 0) {
                         send_msg(client_fd,
@@ -98,7 +113,7 @@ static void handle_host(
 
         int32_t slot = room_find_free_slot(rooms, max_rooms);
         if (slot == -1) {
-                // shouldn't happen (checked before calling), but guard anyway
+                /* shouldn't happen — checked before calling — but guard anyway */
                 send_msg(client_fd,
                          "ERROR: Server is at maximum room capacity.\n", s);
                 free(id); free(pw);
@@ -107,30 +122,37 @@ static void handle_host(
         }
 
         Room *room = &rooms[slot];
-        strncpy(room->id,       id,     MAX_ID_LEN - 1);
-        strncpy(room->password, pw,     MAX_PW_LEN - 1);
-        strncpy(room->host_ip,  peer_ip,MAX_IP_LEN - 1);
-        room->port              = peer_port;
-        room->fd                = client_fd;
-        room->session           = *s;
-        room->creation_time     = time(NULL);
-        room->is_active         = true;
+        strncpy(room->room_id,       id,      MAX_ID_LEN - 1);
+        strncpy(room->room_password, pw,      MAX_PW_LEN - 1);
+        strncpy(room->host_ip,       peer_ip, MAX_IP_LEN - 1);
+        room->host_port      = peer_port;
+        room->host_fd        = client_fd;
+        room->host_session   = *s;           /* save E2EE keys for later */
+        room->creation_time  = time(NULL);
+        room->is_active      = true;
 
         free(id);
         free(pw);
 
-        printf("Host registered in slot %d room='%s' waiting for peer...\n",
-               slot, room->id);
+        printf("Host registered in slot %d  room='%s'  waiting for peer...\n",
+               slot, room->room_id);
 
         send_msg(client_fd, "Room created. Waiting for peer to join...\n", s);
+        /*
+         * We intentionally do NOT close client_fd here.
+         * The fd stays open so we can push the joiner's IP:Port
+         * to the host once someone joins.
+         */
 }
 
+/* ── handle_joiner ───────────────────────────────────────────────────────── */
+
 static void handle_joiner(
-        int32_t         client_fd,
+        int32_t          client_fd,
         const char      *peer_ip,
-        uint16_t        peer_port,
-        Room            rooms[],
-        uint32_t        max_rooms,
+        uint16_t         peer_port,
+        Room             rooms[],
+        uint32_t         max_rooms,
         const Session   *s)
 {
         char *id = ask_n_receive("HostRoom ID (case sensitive): ", client_fd, s);
@@ -149,10 +171,10 @@ static void handle_joiner(
         char *pw = ask_n_receive("HostRoom password (case sensitive): ", client_fd, s);
         if (!pw) { close(client_fd); return; }
 
-        if (strncmp(pw, room->password, MAX_PW_LEN) != 0) {
+        if (strncmp(pw, room->room_password, MAX_PW_LEN) != 0) {
                 send_msg(client_fd, "ERROR: Invalid password.\n", s);
                 printf("Joiner provided wrong password for room '%s'.\n",
-                       room->id);
+                       room->room_id);
                 free(pw);
                 close(client_fd);
                 return;
@@ -160,94 +182,109 @@ static void handle_joiner(
         free(pw);
 
         printf("Credentials matched for room '%s'. Exchanging IP:Port.\n",
-               room->id);
+               room->room_id);
 
+        /*
+         * Build IP:Port strings and send them encrypted to each side.
+         * The host session key was stored when the room was created.
+         */
         char to_host[64], to_join[64];
         snprintf(to_host, sizeof(to_host), "%s:%d\n", peer_ip,       peer_port);
-        snprintf(to_join, sizeof(to_join), "%s:%d\n", room->host_ip, room->port);
+        snprintf(to_join, sizeof(to_join), "%s:%d\n", room->host_ip, room->host_port);
 
-        crypto_encrypt_send(room->fd, to_host, &room->session);
-        crypto_encrypt_send(client_fd, to_join, s);
+        /*
+         * NOTE: Both the host and the joiner have already completed their own
+         * independent key exchanges (stored in room->host_session and s),
+         * so we encrypt each message with the correct session.
+         */
+        crypto_encrypt_send(room->host_fd, to_host, &room->host_session);
+        crypto_encrypt_send(client_fd,     to_join, s);
 
-        printf("Handshake complete! Tearing down rendezvous for room '%s'.\n", room->id);
+        printf("Handshake complete. Tearing down rendezvous for room '%s'.\n",
+               room->room_id);
 
-        close(room->fd);
+        close(room->host_fd);
         close(client_fd);
         room->is_active = false;
 }
 
+/* ── main ─────────────────────────────────────────────────────────────────── */
+
 int main(int argc, char **argv)
 {
-        uint16_t listen_port  = DEFAULT_PORT;
-        char    *log_filename = DEFAULT_LOG_FILE;
-        uint32_t max_rooms    = MAX_ROOMS;
+        uint16_t  listen_port  = DEFAULT_PORT;
+        char     *log_filename = DEFAULT_LOG_FILE;
+        uint32_t  max_rooms    = MAX_ROOMS;
 
-        // cmd arg parsing
-        if (argc >= 2) {
-                uint8_t i;
-                for (i = 1; i < argc; i++) {
-                        if (!strncmp(argv[i], "-p", 2) || !strncmp(argv[i], "--port", 6)) {
-                                if (i + 1 < argc) {
-                                        listen_port = atoi(argv[++i]);
-                                }
-                                else {
-                                        fprintf(stderr, "ERROR: Missing port number after '%s' flag\n", argv[i]);
-                                        return 1;
-                                }
-                        }
-                        else if (!strncmp(argv[i], "-l", 2) || !strncmp(argv[i], "--log", 5)) {
-                                if (i + 1 < argc) log_filename = argv[++i];
-                                else printf("No filename provided. Default: 'con.log'\n");
-                        }
-                        else if (!strncmp(argv[i], "-m", 2) || !strncmp(argv[i], "--max-rooms", 11)) {
-                                if (i + 1 < argc) max_rooms = atoi(argv[++i]);
-                                else printf("No number provided. Default: 5000\n");
-                        }
-                        else if (!strncmp(argv[i], "-h", 2) || !strncmp(argv[i], "--help", 6)) {
-                                usage(argv[0]);
-                        }
+        for (int i = 1; i < argc; i++) {
+                if (!strncmp(argv[i], "-p", 2)
+                    || !strncmp(argv[i], "--port", 6))
+                {
+                        if (i + 1 < argc) listen_port = (uint16_t)atoi(argv[++i]);
+                        else { fprintf(stderr, "ERROR: Missing port.\n"); return 1; }
+                }
+                else if (!strncmp(argv[i], "-l", 2)
+                         || !strncmp(argv[i], "--log", 5))
+                {
+                        if (i + 1 < argc) log_filename = argv[++i];
+                        else printf("No filename provided. Default: '%s'\n",
+                                    DEFAULT_LOG_FILE);
+                }
+                else if (!strncmp(argv[i], "-m", 2)
+                         || !strncmp(argv[i], "--max-rooms", 11))
+                {
+                        if (i + 1 < argc) max_rooms = (uint32_t)atoi(argv[++i]);
+                        else printf("No number provided. Default: %d\n", MAX_ROOMS);
+                }
+                else if (!strncmp(argv[i], "-h", 2)
+                         || !strncmp(argv[i], "--help", 6))
+                {
+                        usage(argv[0]);
                 }
         }
-        printf("INFO: Port: %d, Logfile: %s, Max rooms: %u\n",
+
+        printf("INFO: Port=%d  Log=%s  MaxRooms=%u\n",
                listen_port, log_filename, max_rooms);
 
-        // Setup server socket
-        int32_t server_fd;
-        if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-                fprintf(stderr, "ERROR: Socket creation failed\n");
+        /* init libsodium — must happen before any crypto call */
+        if (sodium_init() < 0) {
+                fprintf(stderr, "ERROR: libsodium init failed.\n");
                 return 1;
         }
 
-        // We should allow port reuse So we don't get "Address already in use" error
+        /* set up listening socket */
+        int32_t server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd == -1) {
+                fprintf(stderr, "ERROR: socket() failed.\n");
+                return 1;
+        }
+
         int32_t opt = 1;
-        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-                fprintf(stderr, "ERROR: setsockopt() failed\n");
+        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                       &opt, sizeof(opt)) == -1) {
+                fprintf(stderr, "ERROR: setsockopt() failed.\n");
                 return 1;
         }
 
-        // Configure the server address tructure
-        struct sockaddr_in server_addr;
-        server_addr.sin_family          = AF_INET;
-        server_addr.sin_addr.s_addr     = INADDR_ANY;
-        server_addr.sin_port            = htons(listen_port);
+        struct sockaddr_in sa = {0};
+        sa.sin_family          = AF_INET;
+        sa.sin_addr.s_addr     = INADDR_ANY;
+        sa.sin_port            = htons(listen_port);
 
-        // Bind the socket to the port
-        if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
-                fprintf(stderr, "ERROR: bind() failed\n");
+        if (bind(server_fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
+                fprintf(stderr, "ERROR: bind() failed.\n");
                 return 1;
         }
-
-        // let's listen
         if (listen(server_fd, 5) == -1) {
-                fprintf(stderr, "ERROR: listen() failed\n");
+                fprintf(stderr, "ERROR: listen() failed.\n");
                 return 1;
         }
 
-        printf("Server listening on port %d...\n", listen_port);
+        printf("Rendezvous server listening on port %d...\n", listen_port);
 
         Room *rooms = calloc(max_rooms, sizeof(Room));
         if (!rooms) {
-                fprintf(stderr, "ERROR: Failed to calloc() room table (%u rooms)\n", max_rooms);
+                fprintf(stderr, "ERROR: calloc() failed for room table.\n");
                 close(server_fd);
                 return 1;
         }
@@ -260,18 +297,18 @@ int main(int argc, char **argv)
                                            (struct sockaddr *)&ca, &ca_len);
                 if (client_fd == -1) {
                         fprintf(stderr, "WARNING: accept() failed, skipping.\n");
-                        continue; // We will not crash, we just skip
+                        continue;
                 }
 
-                // Extract peer's IP:Port
-                char *peer_ip           = inet_ntoa(ca.sin_addr);
-                uint16_t peer_port      = ntohs(ca.sin_port);
+                char    *peer_ip   = inet_ntoa(ca.sin_addr);
+                uint16_t peer_port = ntohs(ca.sin_port);
                 printf("\n--- New connection from %s:%d ---\n",
                        peer_ip, peer_port);
 
-                // expire stale rooms on every new connection
+                /* expire stale rooms on every new connection */
                 room_expire_stale(rooms, max_rooms);
 
+                /* ── E2EE handshake with this client ── */
                 Session s = {0};
                 if (!crypto_do_key_exchange(client_fd, &s)) {
                         fprintf(stderr, "WARNING: Key exchange failed with %s:%d."
@@ -282,6 +319,7 @@ int main(int argc, char **argv)
                 printf("Secure channel established with %s:%d.\n",
                        peer_ip, peer_port);
 
+                /* now everything goes over the encrypted channel */
                 char *choice = ask_n_receive(
                         "Are you [H]ost or [J]oin? [h/j]: ",
                         client_fd, &s);
