@@ -29,4 +29,4 @@ room.o:        src/room.c        include/room.h include/crypto.h
 rendezvous.o:  src/rendezvous.c  include/crypto.h include/net.h include/room.h
 
 clean:
-	rm -f *.o peer rendezvous
+	rm -f src/*.o peer rendezvous
