@@ -3,241 +3,175 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <time.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
+#include <sodium.h>
 
-// buffer lengths
-#define MAX_ID_LEN              8
-#define MAX_PW_LEN              8
-#define MAX_IP_LEN              16
-#define MAX_ROOMS               5000
+#include "../include/crypto.h"
+#include "../include/room.h"
 
-// room expires after 3 minutes of waiting
-#define ROOM_TTL_SECONDS        180
-
-// default vals
 #define DEFAULT_PORT            8888
 #define DEFAULT_LOG_FILE        "con.log"
 
-typedef struct {
-        char            host_ip[MAX_IP_LEN];
-        char            room_password[MAX_PW_LEN];
-        char            room_id[MAX_ID_LEN];
-        time_t          creation_time;
-        int32_t         host_fd;
-        uint16_t        host_port;
-        bool            is_active;
-} Room;
-
-void strip_newline(char *str) {
+static void strip_newline(char *str)
+{
         str[strcspn(str, "\r\n")] = 0;
 }
 
-void usage(const char *exe_file) {
+static void usage(const char *exe_file)
+{
         printf("Usage: %s [options]\n\n", exe_file);
         printf("Options:\n");
-        printf("        -p, --port <port num>           Set port number to listen (default=8888)\n");
-        printf("        -l, --log <filename>            Set logging filename     (default='con.log')\n");
-        printf("        -m, --max-rooms <number>        Set max rooms in queue   (default=5000)\n");
+        printf("        -p, --port <port num>           Set port number to listen (default=%d)\n",
+               DEFAULT_PORT);
+        printf("        -l, --log <filename>            Set logging filename     (default='%s')\n",
+               DEFAULT_LOG_FILE);
+        printf("        -m, --max-rooms <number>        Set max rooms in queue   (default=%d)\n",
+               MAX_ROOMS);
         printf("        -h, --help                      Show this help message\n\n");
         printf("Example:\n");
         printf("        %s -p 2222 -l server.log\n", exe_file);
-        exit(1);
+        exit(0);
 }
 
-// Ask and receive info from peer.
-// Returns heap-allocated string on success, NULL on disconnect.
-// Caller must free() the returned pointer.
-char *ask_n_receive(const char *prompt, int32_t client_fd) {
-        char *buffer = calloc(0xff, sizeof(char));
-        if (!buffer) return NULL;
+/*
+ * Send a prompt to the client over an encrypted session, then receive
+ * the response. The "INPUT: " prefix tells peer.c to read from stdin.
+ *
+ * Returns a heap-allocated, NULL-terminated string on success.
+ * Returns NULL on disconnect or error. Caller must free().
+ */
+static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
+{
+        size_t send_len = strlen(prompt) + 9;
+        char  *tagged   = malloc(send_len);
+        if (!tagged) return NULL;
+        snprintf(tagged, send_len, "INPUT: %s ", prompt);
 
-        // "INPUT: " prefix tells peer.c to read stdin
-        char send_prompt[strlen(prompt) + 9];
-        snprintf(send_prompt, sizeof(send_prompt), "INPUT: %s ", prompt);
-
-        send(client_fd, send_prompt, strlen(send_prompt), 0);
-
-        int32_t bytes_received = recv(client_fd, buffer, 0xff - 1, 0);
-        if (bytes_received <= 0) {
-                fprintf(stderr, "ERROR: Disconnected during '%s' input.\n", prompt);
-                free(buffer);
+        if (!crypto_encrypt_send(fd, tagged, s)) {
+                free(tagged);
                 return NULL;
         }
+        free(tagged);
 
-        strip_newline(buffer);
-        return buffer;
+        char *response = NULL;
+        if (!crypto_recv_decrypt(fd, &response, s)) return NULL;
+
+        strip_newline(response);
+        return response;
 }
-
-// Returns the first free (inactive) slot index, or -1 if full.
-int32_t find_free_slot(Room rooms[], uint32_t max_rooms) {
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (!rooms[i].is_active) return (int32_t)i;
-        }
-        return -1;
-}
-
-// Returns pointer to an active room matching id, or NULL if not found.
-Room *find_room_by_id(Room rooms[], uint32_t max_rooms, const char *id) {
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (!rooms[i].is_active) continue;
-                // stored id length used to guard against prefix matches
-                if (!strncmp(rooms[i].room_id, id, MAX_ID_LEN)) return &rooms[i];
-        }
-        return NULL;
-}
-
-// Returns true if id is already taken by an active room.
-bool room_id_exists(Room rooms[], uint32_t max_rooms, const char *id) {
-        return find_room_by_id(rooms, max_rooms, id) != NULL;
-}
-
-// Scans all slots and expires any room older than ROOM_TTL_SECONDS.
-// Closes the waiting host's fd so they get a clean disconnect.
-void expire_stale_rooms(Room rooms[], uint32_t max_rooms) {
-        time_t now = time(NULL);
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (!rooms[i].is_active) continue; // No need to touch inactive rooms
-                if (difftime(now, rooms[i].creation_time) > ROOM_TTL_SECONDS) {
-                        printf("NOTICE: Room '%s' expired (>%ds). Closing host fd.\n",
-                               rooms[i].room_id, ROOM_TTL_SECONDS);
-                        const char *msg = "ERROR: Room expired. No peer joined in time.\n";
-                        send(rooms[i].host_fd, msg, strlen(msg), 0);
-                        close(rooms[i].host_fd);
-                        rooms[i].is_active = false;
-                }
-        }
-}
-
-void print_room_stats(Room rooms[], uint32_t max_rooms) {
-        uint32_t active = 0;
-        for (uint32_t i = 0; i < max_rooms; i++) {
-                if (rooms[i].is_active) active++;
-        }
-        printf("INFO: Active rooms: %u / %u\n", active, max_rooms);
-}
-
-void handle_host(
+static void handle_host(
         int32_t         client_fd,
         const char      *peer_ip,
         uint16_t        peer_port,
         Room            rooms[],
-        uint32_t        max_rooms
-) {
+        uint32_t        max_rooms,
+        const Session   *s)
+{
         // Ask for room ID - retry until a non-duplicate is given
         char *id = NULL;
         for (;;) {
-                id = ask_n_receive("HostRoom ID (7 chars): ", client_fd);
+                id = ask_n_receive("HostRoom ID (7 chars): ", client_fd, s);
                 if (!id) return; // peer disconnected
 
                 if (strlen(id) == 0) {
-                        const char *msg = "INPUT: ID cannot be empty. Try again: ";
-                        send(client_fd, msg, strlen(msg), 0);
+                        send_msg(client_fd,
+                                 "INPUT: ID cannot be empty. Try again: ", s);
                         free(id);
                         continue;
                 }
 
                 if (room_id_exists(rooms, max_rooms, id)) {
-                        const char *msg = "INPUT: That ID is already in use. Choose another: ";
-                        send(client_fd, msg, strlen(msg), 0);
+                        send_msg(client_fd,
+                                 "INPUT: That ID is already in use. Choose another: ", s);
                         free(id);
                         continue;
                 }
 
-                break; // Unique non-empty ID found
+                break;
         }
 
-        char *pw = ask_n_receive("HostRoom password (7 chars): ", client_fd);
-        if (!pw) {
-                free(id);
-                return;
-        }
+        char *pw = ask_n_receive("HostRoom password (7 chars): ", client_fd, s);
+        if (!pw) { free(id); return; }
 
-        int32_t slot = find_free_slot(rooms, max_rooms);
+        int32_t slot = room_find_free_slot(rooms, max_rooms);
         if (slot == -1) {
                 // shouldn't happen (checked before calling), but guard anyway
-                const char *msg = "ERROR: Server is at maximum room capacity.\n";
-                send(client_fd, msg, strlen(msg), 0);
-                free(id);
-                free(pw);
+                send_msg(client_fd,
+                         "ERROR: Server is at maximum room capacity.\n", s);
+                free(id); free(pw);
                 close(client_fd);
                 return;
         }
 
         Room *room = &rooms[slot];
-        strncpy(room->room_id,          id,     MAX_ID_LEN - 1);
-        strncpy(room->room_password,    pw,     MAX_PW_LEN - 1);
-        strncpy(room->host_ip,          peer_ip,MAX_IP_LEN - 1);
-        room->host_port         = peer_port;
-        room->host_fd           = client_fd;
+        strncpy(room->id,       id,     MAX_ID_LEN - 1);
+        strncpy(room->password, pw,     MAX_PW_LEN - 1);
+        strncpy(room->host_ip,  peer_ip,MAX_IP_LEN - 1);
+        room->port              = peer_port;
+        room->fd                = client_fd;
+        room->session           = *s;
         room->creation_time     = time(NULL);
         room->is_active         = true;
 
         free(id);
         free(pw);
 
-        printf("Host registered in slot %d. Room ID: '%s'. Waiting for peer...\n",
-               slot, room->room_id);
+        printf("Host registered in slot %d room='%s' waiting for peer...\n",
+               slot, room->id);
 
-        const char *ok_msg = "Room created. Waiting for peer to join...\n";
-        send(client_fd, ok_msg, strlen(ok_msg), 0);
+        send_msg(client_fd, "Room created. Waiting for peer to join...\n", s);
 }
 
-void handle_joiner(
+static void handle_joiner(
         int32_t         client_fd,
         const char      *peer_ip,
         uint16_t        peer_port,
         Room            rooms[],
-        uint32_t        max_rooms
-) {
-        // ask for ID to verify
-        char *id = ask_n_receive("HostRoom ID (case sensitive): ", client_fd);
+        uint32_t        max_rooms,
+        const Session   *s)
+{
+        char *id = ask_n_receive("HostRoom ID (case sensitive): ", client_fd, s);
         if (!id) return;
 
-        Room *room = find_room_by_id(rooms, max_rooms, id);
+        Room *room = room_find_by_id(rooms, max_rooms, id);
         free(id);
 
         if (!room) {
-                const char *msg = "ERROR: Room ID not found.\n";
-                send(client_fd, msg, strlen(msg), 0);
+                send_msg(client_fd, "ERROR: Room ID not found.\n", s);
                 printf("Joiner requested non-existent room.\n");
                 close(client_fd);
                 return;
         }
 
-        // Ask for password
-        char *pw = ask_n_receive("HostRoom password (case sensitive): ", client_fd);
-        if (!pw) {
-                close(client_fd);
-                return;
-        }
+        char *pw = ask_n_receive("HostRoom password (case sensitive): ", client_fd, s);
+        if (!pw) { close(client_fd); return; }
 
-        if (strncmp(pw, room->room_password, MAX_PW_LEN)) {
-                const char *msg = "ERROR: Invalid password.\n";
-                send(client_fd, msg, strlen(msg), 0);
-                printf("Joiner provided wrong password for room '%s'.\n", room->room_id);
+        if (strncmp(pw, room->password, MAX_PW_LEN) != 0) {
+                send_msg(client_fd, "ERROR: Invalid password.\n", s);
+                printf("Joiner provided wrong password for room '%s'.\n",
+                       room->id);
                 free(pw);
                 close(client_fd);
                 return;
         }
         free(pw);
 
-        printf("Credentials matched! Exchanging IP:Port for room '%s'.\n", room->room_id);
+        printf("Credentials matched for room '%s'. Exchanging IP:Port.\n",
+               room->id);
 
-        char msg_to_host[0xff];
-        char msg_to_join[0xff];
-        snprintf(msg_to_host, sizeof(msg_to_host), "%s:%d\n", peer_ip, peer_port);
-        snprintf(msg_to_join, sizeof(msg_to_join), "%s:%d\n", room->host_ip, room->host_port);
+        char to_host[64], to_join[64];
+        snprintf(to_host, sizeof(to_host), "%s:%d\n", peer_ip,       peer_port);
+        snprintf(to_join, sizeof(to_join), "%s:%d\n", room->host_ip, room->port);
 
-        send(room->host_fd, msg_to_host, strlen(msg_to_host), 0);
-        send(client_fd,     msg_to_join, strlen(msg_to_join), 0);
+        crypto_encrypt_send(room->fd, to_host, &room->session);
+        crypto_encrypt_send(client_fd, to_join, s);
 
-        printf("Handshake complete! Tearing down rendezvous for room '%s'.\n", room->room_id);
+        printf("Handshake complete! Tearing down rendezvous for room '%s'.\n", room->id);
 
-        close(room->host_fd);
+        close(room->fd);
         close(client_fd);
         room->is_active = false;
 }
@@ -319,53 +253,67 @@ int main(int argc, char **argv)
         }
 
         for (;;) {
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
+                struct sockaddr_in ca;
+                socklen_t ca_len = sizeof(ca);
 
-                int32_t client_fd = accept(
-                        server_fd,
-                        (struct sockaddr *)&client_addr,
-                        &client_len);
+                int32_t client_fd = accept(server_fd,
+                                           (struct sockaddr *)&ca, &ca_len);
                 if (client_fd == -1) {
                         fprintf(stderr, "WARNING: accept() failed, skipping.\n");
                         continue; // We will not crash, we just skip
                 }
 
                 // Extract peer's IP:Port
-                char *peer_ip           = inet_ntoa(client_addr.sin_addr);
-                uint16_t peer_port      = ntohs(client_addr.sin_port);
-                printf("\n--- New Connection from %s:%d ---\n", peer_ip, peer_port);
+                char *peer_ip           = inet_ntoa(ca.sin_addr);
+                uint16_t peer_port      = ntohs(ca.sin_port);
+                printf("\n--- New connection from %s:%d ---\n",
+                       peer_ip, peer_port);
 
                 // expire stale rooms on every new connection
-                expire_stale_rooms(rooms, max_rooms);
+                room_expire_stale(rooms, max_rooms);
 
-                char *choice = ask_n_receive("Are you [H]ost or [J]oin? [h/j]: ", client_fd);
+                Session s = {0};
+                if (!crypto_do_key_exchange(client_fd, &s)) {
+                        fprintf(stderr, "WARNING: Key exchange failed with %s:%d."
+                                " Dropping.\n", peer_ip, peer_port);
+                        close(client_fd);
+                        continue;
+                }
+                printf("Secure channel established with %s:%d.\n",
+                       peer_ip, peer_port);
+
+                char *choice = ask_n_receive(
+                        "Are you [H]ost or [J]oin? [h/j]: ",
+                        client_fd, &s);
                 if (!choice) {
-                        fprintf(stderr, "WARNING: Peer disconnected before answering, skipping...\n");
+                        fprintf(stderr, "WARNING: Peer disconnected before"
+                                " answering, skipping.\n");
+                        close(client_fd);
                         continue;
                 }
 
-                if (!strncmp(choice, "H", 1) || !strncmp(choice, "h", 1)) {
-                        if (find_free_slot(rooms, max_rooms) == -1) {
-                                const char *msg = "ERROR: Server is at maximum room capacity.\n";
-                                send(client_fd, msg, strlen(msg), 0);
+                if (choice[0] == 'H' || choice[0] == 'h') {
+                        if (room_find_free_slot(rooms, max_rooms) == -1) {
+                                send_msg(client_fd,
+                                         "ERROR: Server is at maximum room"
+                                         " capacity.\n", &s);
                                 close(client_fd);
-                        }
-                        else {
-                                handle_host(client_fd, peer_ip, peer_port, rooms, max_rooms);
+                        } else {
+                                handle_host(client_fd, peer_ip, peer_port,
+                                            rooms, max_rooms, &s);
                         }
                 }
-                else if (!strncmp(choice, "J", 1) || !strncmp(choice, "j", 1)) {
-                        handle_joiner(client_fd, peer_ip, peer_port, rooms, max_rooms);
+                else if (choice[0] == 'J' || choice[0] == 'j') {
+                        handle_joiner(client_fd, peer_ip, peer_port,
+                                      rooms, max_rooms, &s);
                 }
                 else {
-                        const char *msg = "ERROR: Invalid selection.\n";
-                        send(client_fd, msg, strlen(msg), 0);
+                        send_msg(client_fd, "ERROR: Invalid selection.\n", &s);
                         close(client_fd);
                 }
 
                 free(choice);
-                print_room_stats(rooms, max_rooms);
+                room_print_stats(rooms, max_rooms);
         }
 
         free(rooms);

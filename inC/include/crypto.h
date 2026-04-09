@@ -60,4 +60,9 @@ bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s);
  */
 bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s);
 
+/*
+ * Just send state information to the peer
+ */
+bool send_msg(int32_t fd, const char *msg, const Session *s);
+
 #endif

@@ -26,4 +26,6 @@ bool net_recv_all(int32_t fd, void *buf, size_t len);
  *
  * Returns the fd on success, or -1 on failure
  */
+int32_t net_make_bound_socket(const struct sockaddr_in *local_addr);
+
 #endif
