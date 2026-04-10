@@ -13,13 +13,9 @@
 #include "../include/crypto.h"
 #include "../include/net.h"
 
-/* ── defaults ────────────────────────────────────────────────────────────── */
-
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
 #define MAX_IP_LEN              16
-
-/* ── types ───────────────────────────────────────────────────────────────── */
 
 typedef struct {
         char     server_ip[MAX_IP_LEN];
@@ -31,8 +27,6 @@ typedef struct {
         char     ip[MAX_IP_LEN];
         uint16_t port;
 } PeerInfo;
-
-/* ── helpers ─────────────────────────────────────────────────────────────── */
 
 static void resolve_domain(const char *domain, char *out_ip)
 {
@@ -99,8 +93,6 @@ static Config parse_args(int argc, char **argv)
         return cfg;
 }
 
-/* ── connect to rendezvous ───────────────────────────────────────────────── */
-
 static int32_t connect_to_rendezvous(
         const Config            *cfg,
         const struct sockaddr_in *local_addr)
@@ -131,121 +123,121 @@ static int32_t connect_to_rendezvous(
  * Mirrors send_binary() in rendezvous.c.
  */
 static bool send_binary(
-	int32_t        fd,
-	const uint8_t *data,
-	uint32_t       len,
-	const Session *s)
+        int32_t        fd,
+        const uint8_t *data,
+        uint32_t       len,
+        const Session *s)
 {
-	uint32_t cipher_len = len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
-	size_t packet_size = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-				sizeof(uint32_t) +
-				cipher_len;
+        uint32_t ciphertext_len = len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
+        size_t   packet_size    = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+                                  + sizeof(uint32_t)
+                                  + ciphertext_len;
 
-	uint8_t *packet = malloc(packet_size);
-	if (!packet) {
-		fprintf(stderr, "ERROR: send_binary(): malloc(packet) failed.\n");
-		return false;
-	}
+        uint8_t *packet = malloc(packet_size);
+        if (!packet) {
+                fprintf(stderr, "ERROR: malloc failed (send_binary).\n");
+                return false;
+        }
 
-	uint8_t *nonce = packet;
-	randombytes_buf(nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+        uint8_t *nonce = packet;
+        randombytes_buf(nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
 
-	uint32_t net_len = htonl(len);
-	memcpy(packet + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
-		&net_len, sizeof(uint32_t));
+        uint32_t net_len = htonl(len);
+        memcpy(packet + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+               &net_len, sizeof(uint32_t));
 
-	uint8_t *cipher = packet +
-		crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-		sizeof(uint32_t);
-	unsigned long long actual_clen;
-	crypto_aead_xchacha20poly1305_ietf_encrypt(
-		cipher, &actual_clen,
-		data, len,
-		NULL, 0, NULL,
-		nonce, s->tx);
+        uint8_t           *ct = packet
+                                + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+                                + sizeof(uint32_t);
+        unsigned long long actual_clen;
+        crypto_aead_xchacha20poly1305_ietf_encrypt(
+                ct, &actual_clen,
+                data, len,
+                NULL, 0, NULL,
+                nonce, s->tx);
 
-	bool ok = (send(fd, packet, packet_size, 0) == (ssize_t)packet_size);
-	if (!ok) fprintf(stderr, "ERROR: send_binary(): failed.\n");
+        bool ok = (send(fd, packet, packet_size, 0) == (ssize_t)packet_size);
+        if (!ok) fprintf(stderr, "ERROR: send_binary failed.\n");
 
-	free(packet);
-	return ok;
+        free(packet);
+        return ok;
 }
 
 /*
  * Counterpart to send_binary.  Allocates *out_data (caller must free).
  */
 static bool recv_binary(
-	int32_t 	fd,
-	uint8_t 	**out_data,
-	uint32_t 	*out_len,
-	const Session 	*s)
+        int32_t   fd,
+        uint8_t **out_data,
+        uint32_t *out_len,
+        const Session *s)
 {
-	uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-	if (!net_recv_all(fd, nonce, sizeof(nonce))) {
-		fprintf(stderr, "ERROR: recv_binary(): disconnected reading nonce.\n");
-		return false;
-	}
+        uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+        if (!net_recv_all(fd, nonce, sizeof(nonce))) {
+                fprintf(stderr, "ERROR: recv_binary: disconnected reading nonce.\n");
+                return false;
+        }
 
-	uint32_t net_len;
-	if (!net_recv_all(fd, &net_len, sizeof(net_len))) {
-		fprintf(stderr, "ERROR: recv_binary(): disconnected reading length.\n");
-		return false;
-	}
-	uint32_t plain_len = ntohl(net_len);
-	uint32_t cipher_len = plain_len +
-				crypto_aead_xchacha20poly1305_ietf_ABYTES;
+        uint32_t net_len;
+        if (!net_recv_all(fd, &net_len, sizeof(net_len))) {
+                fprintf(stderr, "ERROR: recv_binary: disconnected reading length.\n");
+                return false;
+        }
+        uint32_t plaintext_len  = ntohl(net_len);
+        uint32_t ciphertext_len = plaintext_len
+                                  + crypto_aead_xchacha20poly1305_ietf_ABYTES;
 
-	uint8_t *cipher = malloc(cipher_len);
-	if (!cipher) return false;
-	if (!net_recv_all(fd, cipher, cipher_len)) {
-		free(cipher);
-		return false;
-	}
+        uint8_t *ciphertext = malloc(ciphertext_len);
+        if (!ciphertext) return false;
+        if (!net_recv_all(fd, ciphertext, ciphertext_len)) {
+                free(ciphertext);
+                return false;
+        }
 
-	uint8_t *plain = malloc(plain_len);
-	if (!plain) { free(cipher); return false; }
+        uint8_t *plaintext = malloc(plaintext_len);
+        if (!plaintext) { free(ciphertext); return false; }
 
-	unsigned long long actual_plen;
-	int32_t rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-		plain, &actual_plen,
-		NULL,
-		cipher, cipher_len,
-		NULL, 0,
-		nonce, s->rx);
+        unsigned long long actual_plen;
+        int32_t rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+                plaintext, &actual_plen,
+                NULL,
+                ciphertext, ciphertext_len,
+                NULL, 0,
+                nonce, s->rx);
 
-	free(cipher);
+        free(ciphertext);
 
-	if (rc != 0) {
-		fprintf(stderr, "FATAL: recv_binary(): authentication failed.\n");
-		free(plain);
-		return false;
-	}
+        if (rc != 0) {
+                fprintf(stderr, "FATAL: recv_binary authentication failed.\n");
+                free(plaintext);
+                return false;
+        }
 
-	*out_data = plain;
-	*out_len = (uint32_t)actual_plen;
-	return true;
+        *out_data = plaintext;
+        *out_len  = (uint32_t)actual_plen;
+        return true;
 }
 
 /*
  * Drive the full rendezvous conversation over the encrypted channel.
  *
- * The server sends TEXT messages (encrypted strings). We handle three kinds:
- * 	"INPUT: ..." -> read stdin, send back encrypted
- * 	"SEND_PUBKE" -> send our P2P public key as an encrypted binary blob
- *	"ERROR: ..." -> print error and return false
- *	"A.B.C.D:Pn" -> peer's IP:Port; the NEXT message will be peer's public key
+ * The server sends TEXT messages (encrypted strings).  We handle three kinds:
+ *   "INPUT: ..."  -> read stdin, send back encrypted
+ *   "SEND_PUBKEY" -> send our P2P public key as an encrypted binary blob
+ *   "ERROR ..."   -> print and return false
+ *   "A.B.C.D:N"  -> peer's IP:Port; the NEXT message will be peer's public key
  *
  * On success:
- * 	*peer 		is filled with the peer's IP and port
- * 	*peer_pub_out	points to a heap-allocated buffer of crypto_kx_PUBLICKEYBYTES
- * 			(caller must free)
+ *   *peer    is filled with the peer's IP and port
+ *   *peer_pub_out points to a heap-allocated buffer of crypto_kx_PUBLICKEYBYTES
+ *                 (caller must free)
  */
 static bool do_rendezvous_exchange(
         int32_t         rendezvous_fd,
         const Session  *s,
-	const Keypair  *my_kp,
+        const Keypair  *my_kp,
         PeerInfo       *peer,
-	uint8_t       **peer_pub_out)
+        uint8_t       **peer_pub_out)
 {
         for (;;) {
                 char *msg = NULL;
@@ -263,7 +255,6 @@ static bool do_rendezvous_exchange(
                 }
 
                 if (strstr(msg, "INPUT: ")) {
-                        /* read one line from stdin and send it back, encrypted */
                         char input[256];
                         if (fgets(input, sizeof(input), stdin) != NULL) {
                                 if (!crypto_encrypt_send(rendezvous_fd, input, s)) {
@@ -271,35 +262,41 @@ static bool do_rendezvous_exchange(
                                         return false;
                                 }
                         }
-                } else if (!strcmp(msg, "SEND PUBKEY")) {
-			printf("\n[Sending P2P public key to rendezvous...]\n");
-			if (!send_binary(rendezvous_fd,
-		    			 my_kp->pub,
-		    			 crypto_kx_PUBLICKEYBYTES, s))
-			{
-				free(msg);
-				return false;
-			}
-		}
-                /* IP:Port reply — format "A.B.C.D:PORT\n" */
+                }
+                else if (strcmp(msg, "SEND_PUBKEY") == 0) {
+                        /*
+                         * Server is asking for our P2P public key.
+                         * Send it as a raw encrypted binary blob.
+                         */
+                        printf("\n[Sending P2P public key to rendezvous...]\n");
+                        if (!send_binary(rendezvous_fd,
+                                         my_kp->pub,
+                                         crypto_kx_PUBLICKEYBYTES, s))
+                        {
+                                free(msg);
+                                return false;
+                        }
+                }
+                /* peer IP:Port — next message will be their public key */
                 else if (sscanf(msg, "%15[^:]:%hu", peer->ip, &peer->port) == 2) {
                         printf("\n>>> Target peer: %s:%d <<<\n",
                                peer->ip, peer->port);
                         free(msg);
 
-			uint8_t *pub  = NULL;
-			uint32_t plen = 0;
-			if (!recv_binary(rendezvous_fd, &pub, &plen, s)
-			    || plen != crypto_kx_PUBLICKEYBYTES)
-			{
-				fprintf(stderr,
-	    				"ERROR: Bad peer public key from rendezvous.\n");
-				free(pub);
-				return false;
-			}
+                        /* receive peer's public key */
+                        uint8_t *pub  = NULL;
+                        uint32_t plen = 0;
+                        if (!recv_binary(rendezvous_fd, &pub, &plen, s)
+                            || plen != crypto_kx_PUBLICKEYBYTES)
+                        {
+                                fprintf(stderr,
+                                        "ERROR: Bad peer public key from rendezvous.\n");
+                                free(pub);
+                                return false;
+                        }
 
-			printf("[Received peer P2P public key from rendezvous.]\n");
-			*peer_pub_out = pub;
+                        printf("[Received peer P2P public key from rendezvous.]\n");
+                        *peer_pub_out = pub;
                         return true;
                 }
 
@@ -307,7 +304,7 @@ static bool do_rendezvous_exchange(
         }
 }
 
-/* ── TCP hole punch ──────────────────────────────────────────────────────── */
+/* ── TCP hole punch ───────────────────────────────────────────────────────── */
 
 static int32_t do_hole_punch(
         const PeerInfo           *peer,
@@ -350,78 +347,82 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-	Keypair my_kp;
-	crypto_gen_keypair(&my_kp);
-	printf("Generated P2P keypair.\n");
+        /*
+         * Generate our P2P keypair BEFORE connecting to rendezvous.
+         * We keep the secret key alive until after crypto_derive_session(),
+         * then zero it immediately.
+         */
+        Keypair my_kp;
+        crypto_gen_keypair(&my_kp);
+        printf("Generated P2P keypair.\n");
 
         struct sockaddr_in local_addr = {0};
         local_addr.sin_family          = AF_INET;
         local_addr.sin_addr.s_addr     = htonl(INADDR_ANY);
         local_addr.sin_port            = htons(cfg.local_port);
 
-        /* ── connect & establish E2EE with rendezvous server ── */
+        /* connect and establish E2EE with rendezvous */
         int32_t rendezvous_fd = connect_to_rendezvous(&cfg, &local_addr);
         if (rendezvous_fd == -1) {
-		sodium_memzero(&my_kp, sizeof(my_kp));
-		return 1;
-	}
+                sodium_memzero(&my_kp, sizeof(my_kp));
+                return 1;
+        }
 
-        Session rs = {0};   /* rendezvous session keys */
+        Session rs = {0};
         if (!crypto_do_key_exchange(rendezvous_fd, &rs)) {
                 fprintf(stderr, "ERROR: Key exchange with rendezvous failed.\n");
-		sodium_memzero(&my_kp, sizeof(my_kp));
+                sodium_memzero(&my_kp, sizeof(my_kp));
                 close(rendezvous_fd);
                 return 1;
         }
         printf("Secure channel with rendezvous established.\n");
 
-        /* ── exchange room credentials over encrypted channel ── */
-        PeerInfo peer    = {0};
-	uint8_t *peer_pub_key = NULL;
+        /* run the rendezvous protocol — get peer's IP:Port and public key */
+        PeerInfo peer         = {0};
+        uint8_t *peer_pub_key = NULL;
 
         bool got_peer = do_rendezvous_exchange(
-		rendezvous_fd, &rs, &my_kp, &peer, &peer_pub_key);
+                rendezvous_fd, &rs, &my_kp, &peer, &peer_pub_key);
 
-        /* zero rendezvous session keys — no longer needed */
         sodium_memzero(&rs, sizeof(rs));
         close(rendezvous_fd);
 
         if (!got_peer) {
-		sodium_memzero(&my_kp, sizeof(my_kp));
-		return 1;
-	}
+                sodium_memzero(&my_kp, sizeof(my_kp));
+                return 1;
+        }
 
-        /* ── TCP hole punch ── */
+        /* TCP hole punch */
         int32_t p2p_fd = do_hole_punch(&peer, &local_addr, 15);
         if (p2p_fd == -1) {
                 fprintf(stderr,
                         "ERROR: Hole punch failed after 15 attempts."
                         " NAT may be too strict.\n");
-		free(peer_pub_key);
-		sodium_memzero(&my_kp, sizeof(my_kp));
+                free(peer_pub_key);
+                sodium_memzero(&my_kp, sizeof(my_kp));
                 return 1;
         }
 
-        printf("\n=== === === === === === === === ===\n");
-        printf("  SUCCESS! P2P CONNECTION ESTABLISHED!");
-        printf("\n=== === === === === === === === ===\n\n");
+        printf("\n===========================\n");
+        printf("SUCCESS! P2P CONNECTION ESTABLISHED!");
+        printf("\n===========================\n\n");
 
-	/*
-	 * Derive the P2P session keys from our keypair and the peer's public
-	 * key - no extra round-trip over the P2P connection needed.
-	 */
+        /*
+         * Derive the P2P session keys from our keypair and the peer's public
+         * key — no extra round-trip over the P2P connection needed.
+         */
         Session ps = {0};
-	bool ok = crypto_derive_session(&my_kp, peer_pub_key, &ps);
+        bool ok = crypto_derive_session(&my_kp, peer_pub_key, &ps);
 
-	free(peer_pub_key);
-	sodium_memzero(&my_kp, sizeof(my_kp));
+        free(peer_pub_key);
+        sodium_memzero(&my_kp, sizeof(my_kp));
 
         if (!ok) {
                 close(p2p_fd);
                 return 1;
         }
 
-        /* ── demo: exchange names over encrypted P2P channel ── */
+        /* demo: exchange names over the encrypted P2P channel */
         char my_name[64];
         printf("Enter your name: ");
         fflush(stdout);
@@ -442,9 +443,9 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        printf("\n=== === === === === === === === ===\n");
-        printf("  Peer says their name is: %s\n", peer_name);
-        printf("=== === === === === === === === ===\n");
+        printf("\n==========================\n");
+        printf("  Peer's name: %s\n", peer_name);
+        printf("===========================\n");
 
         free(peer_name);
         sodium_memzero(&ps, sizeof(ps));
