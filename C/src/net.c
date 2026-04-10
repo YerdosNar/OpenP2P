@@ -2,6 +2,7 @@
 #include "../include/net.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 /* ── recv_all ────────────────────────────────────────────────────────────── */
@@ -46,4 +47,9 @@ int32_t net_make_bound_socket(const struct sockaddr_in *local_addr)
         }
 
         return fd;
+}
+
+void net_strip_newline(char *str)
+{
+        str[strcspn(str, "\r\n")] = '\0';
 }

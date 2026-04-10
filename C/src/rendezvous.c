@@ -16,11 +16,6 @@
 #define DEFAULT_PORT        8888
 #define DEFAULT_LOG_FILE    "con.log"
 
-static void strip_newline(char *str)
-{
-        str[strcspn(str, "\r\n")] = 0;
-}
-
 static void usage(const char *exe)
 {
         printf("Usage: %s [options]\n\n", exe);
@@ -57,139 +52,13 @@ static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
         char *response = NULL;
         if (!crypto_recv_decrypt(fd, &response, s)) return NULL;
 
-        strip_newline(response);
+        net_strip_newline(response);
         return response;
 }
 
 static bool send_msg(int32_t fd, const char *msg, const Session *s)
 {
         return crypto_encrypt_send(fd, msg, s);
-}
-
-/*
- * Receive exactly crypto_kx_PUBLICKEYBYTES raw bytes from the client.
- * This is the peer's P2P public key, sent as a binary blob (not base64),
- * outside of the normal encrypted-message framing — the rendezvous channel
- * E2EE still protects it in transit via the TCP stream encryption, but we
- * read it directly with net_recv_all so we can store the raw bytes in the
- * Room without any encoding overhead.
- *
- * Wait — actually we DO want to send it inside the encrypted framing so it
- * gets the same authentication guarantee as everything else.  We encode it
- * as a binary message using crypto_encrypt_send_raw (see below).
- *
- * We send/recv raw binary pub keys as encrypted blobs.  The rendezvous
- * server never inspects the key bytes; it just stores and forwards them.
- */
-
-/*
- * Encrypted binary send: like crypto_encrypt_send but for raw bytes, not
- * a NUL-terminated string.  We reuse the same packet layout:
- *   [ nonce (24) | plaintext_len (4, net order) | ciphertext+MAC ]
- */
-static bool send_binary(
-        int32_t        fd,
-        const uint8_t *data,
-        uint32_t       len,
-        const Session *s)
-{
-        uint32_t ciphertext_len = len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
-        size_t   packet_size    = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-                                  + sizeof(uint32_t)
-                                  + ciphertext_len;
-
-        uint8_t *packet = malloc(packet_size);
-        if (!packet) {
-                fprintf(stderr, "ERROR: malloc failed (send_binary).\n");
-                return false;
-        }
-
-        uint8_t *nonce = packet;
-        randombytes_buf(nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-
-        uint32_t net_len = htonl(len);
-        memcpy(packet + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
-               &net_len, sizeof(uint32_t));
-
-        uint8_t           *ct = packet
-                                + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-                                + sizeof(uint32_t);
-        unsigned long long actual_clen;
-        crypto_aead_xchacha20poly1305_ietf_encrypt(
-                ct, &actual_clen,
-                data, len,
-                NULL, 0, NULL,
-                nonce, s->tx);
-
-        bool ok = (send(fd, packet, packet_size, 0) == (ssize_t)packet_size);
-        if (!ok) fprintf(stderr, "ERROR: send_binary send() failed.\n");
-
-        free(packet);
-        return ok;
-}
-
-/*
- * Counterpart to send_binary.  Allocates *out_data (caller must free).
- * *out_len is set to the plaintext byte count.
- */
-static bool recv_binary(
-        int32_t   fd,
-        uint8_t **out_data,
-        uint32_t *out_len,
-        const Session *s)
-{
-        uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-        if (!net_recv_all(fd, nonce, sizeof(nonce))) {
-                fprintf(stderr, "ERROR: recv_binary: disconnected reading nonce.\n");
-                return false;
-        }
-
-        uint32_t net_len;
-        if (!net_recv_all(fd, &net_len, sizeof(net_len))) {
-                fprintf(stderr, "ERROR: recv_binary: disconnected reading length.\n");
-                return false;
-        }
-        uint32_t plaintext_len  = ntohl(net_len);
-        uint32_t ciphertext_len = plaintext_len
-                                  + crypto_aead_xchacha20poly1305_ietf_ABYTES;
-
-        uint8_t *ciphertext = malloc(ciphertext_len);
-        if (!ciphertext) {
-                fprintf(stderr, "ERROR: recv_binary: malloc failed.\n");
-                return false;
-        }
-        if (!net_recv_all(fd, ciphertext, ciphertext_len)) {
-                fprintf(stderr, "ERROR: recv_binary: disconnected reading ciphertext.\n");
-                free(ciphertext);
-                return false;
-        }
-
-        uint8_t *plaintext = malloc(plaintext_len);
-        if (!plaintext) {
-                fprintf(stderr, "ERROR: recv_binary: malloc failed (plaintext).\n");
-                free(ciphertext);
-                return false;
-        }
-
-        unsigned long long actual_plen;
-        int32_t rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-                plaintext, &actual_plen,
-                NULL,
-                ciphertext, ciphertext_len,
-                NULL, 0,
-                nonce, s->rx);
-
-        free(ciphertext);
-
-        if (rc != 0) {
-                fprintf(stderr, "FATAL: recv_binary authentication failed.\n");
-                free(plaintext);
-                return false;
-        }
-
-        *out_data = plaintext;
-        *out_len  = (uint32_t)actual_plen;
-        return true;
 }
 
 /* ── handle_host ─────────────────────────────────────────────────────────── */
@@ -238,7 +107,7 @@ static void handle_host(
 
         uint8_t *pub_key = NULL;
         uint32_t pub_len = 0;
-        if (!recv_binary(client_fd, &pub_key, &pub_len, s)
+        if (!crypto_recv_decrypt_bin(client_fd, &pub_key, &pub_len, s)
             || pub_len != crypto_kx_PUBLICKEYBYTES)
         {
                 fprintf(stderr, "ERROR: Bad public key from host.\n");
@@ -329,7 +198,7 @@ static void handle_joiner(
 
         uint8_t *joiner_pub = NULL;
         uint32_t joiner_pub_len = 0;
-        if (!recv_binary(client_fd, &joiner_pub, &joiner_pub_len, s)
+        if (!crypto_recv_decrypt_bin(client_fd, &joiner_pub, &joiner_pub_len, s)
             || joiner_pub_len != crypto_kx_PUBLICKEYBYTES)
         {
                 fprintf(stderr, "ERROR: Bad public key from joiner.\n");
@@ -353,11 +222,13 @@ static void handle_joiner(
          * Each message is encrypted under its recipient's session keys.
          */
         crypto_encrypt_send(room->host_fd, to_host, &room->host_session);
-        send_binary(room->host_fd, joiner_pub,          crypto_kx_PUBLICKEYBYTES,
-                    &room->host_session);
+        crypto_encrypt_send_bin(room->host_fd, joiner_pub,
+                                crypto_kx_PUBLICKEYBYTES,
+                                &room->host_session);
 
         crypto_encrypt_send(client_fd, to_join, s);
-        send_binary(client_fd, room->host_pub_key, crypto_kx_PUBLICKEYBYTES, s);
+        crypto_encrypt_send_bin(client_fd, room->host_pub_key,
+                                crypto_kx_PUBLICKEYBYTES, s);
 
         printf("Handshake complete. Tearing down rendezvous for room '%s'.\n",
                room->room_id);

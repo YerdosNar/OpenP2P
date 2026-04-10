@@ -25,4 +25,9 @@ bool net_recv_all(int32_t fd, void *buf, size_t len);
  */
 int32_t net_make_bound_socket(const struct sockaddr_in *local_addr);
 
+/*
+ * Replace the first '\r' or '\n' in str with '\0'.
+ */
+void net_strip_newline(char *str);
+
 #endif /* NET_H */

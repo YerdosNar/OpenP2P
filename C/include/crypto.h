@@ -12,8 +12,8 @@
  * Key exchange  : X25519  via crypto_kx_*
  * Encryption    : XChaCha20-Poly1305-IETF via crypto_aead_xchacha20poly1305_ietf_*
  *
- * Wire packet format (produced by `encrypt_and_send`,
- *                     consumed by `recv_and_decrypt`):
+ * Wire packet format (produced by `crypto_encrypt_send / crypto_encrypt_send_bin`,
+ *                     consumed by `crypto_recv_decrypt / crypto_recv_decrypt_bin`):
  *
  *   [ nonce (NPUBBYTES=24)                   ]
  *   [ plaintext_len (4 bytes, network order) ]
@@ -48,7 +48,6 @@ void crypto_gen_keypair(Keypair *kp);
  * exactly as in crypto_do_key_exchange() so both sides coverge on the
  * same rx/tx assignment without any extra negotiation.
  *
- * Zeroes kp->sec on completion (success or failure).
  * Returns true on success.
  */
 bool crypto_derive_session(
@@ -81,5 +80,29 @@ bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s);
  * Returns true on success.
  */
 bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s);
+
+/*
+ * Encrypt arbitrary bytes (not NUL-terminated) with s->tx and send.
+ * Uses the same wire format as crypto_encrypt_send.
+ *
+ * Returns true on success.
+ */
+bool crypto_encrypt_send_bin(
+        int32_t        fd,
+        const uint8_t *data,
+        uint32_t       len,
+        const Session *s);
+
+/*
+ * Receive one binary packet from fd, decrypt with s->rx.
+ * Allocates *out_data (caller must free), sets *out_len.
+ *
+ * Returns true on success.
+ */
+bool crypto_recv_decrypt_bin(
+        int32_t        fd,
+        uint8_t      **out_data,
+        uint32_t      *out_len,
+        const Session *s);
 
 #endif /* CRYPTO_H */

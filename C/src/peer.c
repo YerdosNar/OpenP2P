@@ -119,106 +119,6 @@ static int32_t connect_to_rendezvous(
 }
 
 /*
- * Encrypted binary send: sends raw bytes as an encrypted packet.
- * Mirrors send_binary() in rendezvous.c.
- */
-static bool send_binary(
-        int32_t        fd,
-        const uint8_t *data,
-        uint32_t       len,
-        const Session *s)
-{
-        uint32_t ciphertext_len = len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
-        size_t   packet_size    = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-                                  + sizeof(uint32_t)
-                                  + ciphertext_len;
-
-        uint8_t *packet = malloc(packet_size);
-        if (!packet) {
-                fprintf(stderr, "ERROR: malloc failed (send_binary).\n");
-                return false;
-        }
-
-        uint8_t *nonce = packet;
-        randombytes_buf(nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-
-        uint32_t net_len = htonl(len);
-        memcpy(packet + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
-               &net_len, sizeof(uint32_t));
-
-        uint8_t           *ct = packet
-                                + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-                                + sizeof(uint32_t);
-        unsigned long long actual_clen;
-        crypto_aead_xchacha20poly1305_ietf_encrypt(
-                ct, &actual_clen,
-                data, len,
-                NULL, 0, NULL,
-                nonce, s->tx);
-
-        bool ok = (send(fd, packet, packet_size, 0) == (ssize_t)packet_size);
-        if (!ok) fprintf(stderr, "ERROR: send_binary failed.\n");
-
-        free(packet);
-        return ok;
-}
-
-/*
- * Counterpart to send_binary.  Allocates *out_data (caller must free).
- */
-static bool recv_binary(
-        int32_t   fd,
-        uint8_t **out_data,
-        uint32_t *out_len,
-        const Session *s)
-{
-        uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-        if (!net_recv_all(fd, nonce, sizeof(nonce))) {
-                fprintf(stderr, "ERROR: recv_binary: disconnected reading nonce.\n");
-                return false;
-        }
-
-        uint32_t net_len;
-        if (!net_recv_all(fd, &net_len, sizeof(net_len))) {
-                fprintf(stderr, "ERROR: recv_binary: disconnected reading length.\n");
-                return false;
-        }
-        uint32_t plaintext_len  = ntohl(net_len);
-        uint32_t ciphertext_len = plaintext_len
-                                  + crypto_aead_xchacha20poly1305_ietf_ABYTES;
-
-        uint8_t *ciphertext = malloc(ciphertext_len);
-        if (!ciphertext) return false;
-        if (!net_recv_all(fd, ciphertext, ciphertext_len)) {
-                free(ciphertext);
-                return false;
-        }
-
-        uint8_t *plaintext = malloc(plaintext_len);
-        if (!plaintext) { free(ciphertext); return false; }
-
-        unsigned long long actual_plen;
-        int32_t rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-                plaintext, &actual_plen,
-                NULL,
-                ciphertext, ciphertext_len,
-                NULL, 0,
-                nonce, s->rx);
-
-        free(ciphertext);
-
-        if (rc != 0) {
-                fprintf(stderr, "FATAL: recv_binary authentication failed.\n");
-                free(plaintext);
-                return false;
-        }
-
-        *out_data = plaintext;
-        *out_len  = (uint32_t)actual_plen;
-        return true;
-}
-
-/*
  * Drive the full rendezvous conversation over the encrypted channel.
  *
  * The server sends TEXT messages (encrypted strings).  We handle three kinds:
@@ -269,7 +169,7 @@ static bool do_rendezvous_exchange(
                          * Send it as a raw encrypted binary blob.
                          */
                         printf("\n[Sending P2P public key to rendezvous...]\n");
-                        if (!send_binary(rendezvous_fd,
+                        if (!crypto_encrypt_send_bin(rendezvous_fd,
                                          my_kp->pub,
                                          crypto_kx_PUBLICKEYBYTES, s))
                         {
@@ -286,7 +186,7 @@ static bool do_rendezvous_exchange(
                         /* receive peer's public key */
                         uint8_t *pub  = NULL;
                         uint32_t plen = 0;
-                        if (!recv_binary(rendezvous_fd, &pub, &plen, s)
+                        if (!crypto_recv_decrypt_bin(rendezvous_fd, &pub, &plen, s)
                             || plen != crypto_kx_PUBLICKEYBYTES)
                         {
                                 fprintf(stderr,

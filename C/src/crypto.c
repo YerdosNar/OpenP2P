@@ -82,16 +82,14 @@ fail:
 
 /* ── encrypt and send ───────────────────────────────────────────────────── */
 
-bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
+static bool encrypt_send_raw(
+        int32_t        fd,
+        const uint8_t *data,
+        uint32_t       len,
+        const Session *s)
 {
-        uint32_t plaintext_len  = (uint32_t)strlen(msg);
-        uint32_t ciphertext_len = plaintext_len + MAC_LEN;
-
-        /*
-         * Packet layout:
-         *   [ nonce (24) | plaintext_len (4, network order) | ciphertext+MAC ]
-         */
-        size_t packet_size = NONCE_LEN + sizeof(uint32_t) + ciphertext_len;
+        uint32_t ciphertext_len = len + MAC_LEN;
+        size_t   packet_size    = NONCE_LEN + sizeof(uint32_t) + ciphertext_len;
 
         uint8_t *packet = malloc(packet_size);
         if (!packet) {
@@ -104,15 +102,15 @@ bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
         randombytes_buf(nonce, NONCE_LEN);
 
         /* plaintext length in network byte order */
-        uint32_t net_len = htonl(plaintext_len);
+        uint32_t net_len = htonl(len);
         memcpy(packet + NONCE_LEN, &net_len, sizeof(uint32_t));
 
         /* encrypt directly into packet */
-        uint8_t      *ciphertext = packet + NONCE_LEN + sizeof(uint32_t);
+        uint8_t           *ct = packet + NONCE_LEN + sizeof(uint32_t);
         unsigned long long actual_clen;
         crypto_aead_xchacha20poly1305_ietf_encrypt(
-                ciphertext,     &actual_clen,
-                (const uint8_t *)msg, plaintext_len,
+                ct,     &actual_clen,
+                data,   len,
                 NULL, 0,         /* no additional data */
                 NULL,            /* nsec unused */
                 nonce,
@@ -127,7 +125,11 @@ bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
 
 /* ── receive and decrypt ────────────────────────────────────────────────── */
 
-bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s)
+static bool recv_decrypt_raw(
+        int32_t   fd,
+        uint8_t **out_data,
+        uint32_t *out_len,
+        const Session *s)
 {
         /* read nonce */
         uint8_t nonce[NONCE_LEN];
@@ -183,7 +185,43 @@ bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s)
                 return false;
         }
 
-        plaintext[actual_plen] = '\0';
-        *out_buf = (char *)plaintext;
+        *out_data = plaintext;
+        *out_len  = (uint32_t)actual_plen;
         return true;
+}
+
+bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
+{
+        return encrypt_send_raw(fd, (const uint8_t *)msg,
+                                (uint32_t)strlen(msg), s);
+}
+
+bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s)
+{
+        uint8_t *data = NULL;
+        uint32_t len  = 0;
+        if (!recv_decrypt_raw(fd, &data, &len, s))
+                return false;
+
+        data[len] = '\0';
+        *out_buf = (char *)data;
+        return true;
+}
+
+bool crypto_encrypt_send_bin(
+        int32_t        fd,
+        const uint8_t *data,
+        uint32_t       len,
+        const Session *s)
+{
+        return encrypt_send_raw(fd, data, len, s);
+}
+
+bool crypto_recv_decrypt_bin(
+        int32_t        fd,
+        uint8_t      **out_data,
+        uint32_t      *out_len,
+        const Session *s)
+{
+        return recv_decrypt_raw(fd, out_data, out_len, s);
 }

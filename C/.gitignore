@@ -1,3 +1,5 @@
 src/*.o
 peer
 rendezvous
+test/*
+test/
