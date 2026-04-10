@@ -329,22 +329,48 @@ int main(int argc, char **argv)
                 close(p2p_fd);
                 return 1;
         }
-        my_name[strcspn(my_name, "\r\n")] = 0;
+        net_strip_newline(my_name);
 
         if (!crypto_encrypt_send(p2p_fd, my_name, &ps)) {
+                fprintf(stderr, "ERROR: Could not send name.\n");
                 close(p2p_fd);
                 return 1;
         }
+        printf("INFO: Sent my name: '%s'.\n", my_name);
 
         char *peer_name = NULL;
         if (!crypto_recv_decrypt(p2p_fd, &peer_name, &ps)) {
                 close(p2p_fd);
                 return 1;
         }
+        printf("INFO: Received peer's name: '%s'.\n", peer_name);
 
-        printf("\n==========================\n");
-        printf("  Peer's name: %s\n", peer_name);
-        printf("===========================\n");
+        printf("\n======================================================\n");
+        printf("  Your legendary chat with '%s' begins here!", peer_name);
+        printf("\n======================================================\n");
+
+        for (;;) {
+                char message[1024];
+                printf("%s: ", my_name);
+                if (fgets(message, sizeof(message) - 1, stdin) == NULL) {
+                        close(p2p_fd);
+                        return 1;
+                }
+                net_strip_newline(message);
+
+                if (!crypto_encrypt_send(p2p_fd, message, &ps)) {
+                        fprintf(stderr, "ERROR: Could not send message.\n");
+                        close(p2p_fd);
+                        return 1;
+                }
+
+                char *peer_msg = NULL;
+                if (!crypto_recv_decrypt(p2p_fd, &peer_msg, &ps)) {
+                        close(p2p_fd);
+                        return 1;
+                }
+                printf("%s: '%s'.\n", peer_name, peer_msg);
+        }
 
         free(peer_name);
         sodium_memzero(&ps, sizeof(ps));
