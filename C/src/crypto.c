@@ -33,11 +33,11 @@ bool crypto_derive_session(
 	if (cmp < 0) {
 		ret = crypto_kx_client_session_keys(
 			s->rx, s->tx, kp->pub, kp->sec, peer_pub);
-		printf("P2P key-derivation role: CLIENT\n");
+		printf("INFO: P2P key-derivation role: CLIENT\n");
 	} else {
 		ret = crypto_kx_server_session_keys(
 			s->rx, s->tx, kp->pub, kp->sec, peer_pub);
-		printf("P2P key-derivation role: SERVER\n");
+		printf("INFO: P2P key-derivation role: SERVER\n");
 	}
 
 	if (ret != 0) {
@@ -54,14 +54,14 @@ bool crypto_do_key_exchange(int32_t fd, Session *s)
 	Keypair kp;
         crypto_gen_keypair(&kp);
 
-        printf("Generated ephemeral keypair. Exchanging public keys...\n");
+        printf("INFO: Generated ephemeral keypair. Exchanging public keys...\n");
 
         /* send our public key first */
         if (send(fd, kp.pub, sizeof(kp.pub), 0) < 0) {
                 fprintf(stderr, "ERROR: Failed to send public key.\n");
                 goto fail;
         }
-        printf("Sent public key.\n");
+        printf("INFO: Sent public key.\n");
 
         /* receive peer's public key */
         uint8_t peer_pub[crypto_kx_PUBLICKEYBYTES];
@@ -69,7 +69,7 @@ bool crypto_do_key_exchange(int32_t fd, Session *s)
                 fprintf(stderr, "ERROR: Disconnected during key exchange.\n");
                 goto fail;
         }
-        printf("Received peer public key.\n");
+        printf("INFO: Received peer public key.\n");
 
 	bool ok = crypto_derive_session(&kp, peer_pub, s);
 	sodium_memzero(kp.sec, sizeof(kp.sec));

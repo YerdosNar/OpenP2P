@@ -299,20 +299,22 @@ int main(int argc, char **argv)
                     || !strncmp(argv[i], "--port", 6))
                 {
                         if (i + 1 < argc) listen_port = (uint16_t)atoi(argv[++i]);
-                        else { fprintf(stderr, "ERROR: Missing port.\n"); return 1; }
+                        else printf("WARNING: No port provided. Default: '%d'\n",
+                                    DEFAULT_PORT);
                 }
                 else if (!strncmp(argv[i], "-l", 2)
                          || !strncmp(argv[i], "--log", 5))
                 {
                         if (i + 1 < argc) log_filename = argv[++i];
-                        else printf("No filename provided. Default: '%s'\n",
+                        else printf("WARNING: No filename provided. Default: '%s'\n",
                                     DEFAULT_LOG_FILE);
                 }
                 else if (!strncmp(argv[i], "-m", 2)
                          || !strncmp(argv[i], "--max-rooms", 11))
                 {
                         if (i + 1 < argc) max_rooms = (uint32_t)atoi(argv[++i]);
-                        else printf("No number provided. Default: %d\n", MAX_ROOMS);
+                        else printf("WARNING: No number provided. Default: %d\n",
+                                    MAX_ROOMS);
                 }
                 else if (!strncmp(argv[i], "-h", 2)
                          || !strncmp(argv[i], "--help", 6))
@@ -356,7 +358,7 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        printf("Rendezvous server listening on port %d...\n", listen_port);
+        printf("INFO: Rendezvous server listening on port %d...\n", listen_port);
 
         RoomTable rt;
         if (!room_table_init(&rt, max_rooms)) {

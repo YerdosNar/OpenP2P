@@ -119,13 +119,13 @@ bool room_claim_for_joiner(
         Room *room = find_by_id_unlocked(rt->rooms, rt->max_rooms, id);
         if (!room) {
                 pthread_mutex_unlock(&rt->lock);
-                *err_msg = "ERROR: Room ID not found.\n";
+                *err_msg = "ERROR: Invalid ID/Password.\n";
                 return false;
         }
 
         if (strncmp(password, room->room_password, MAX_PW_LEN) != 0) {
                 pthread_mutex_unlock(&rt->lock);
-                *err_msg = "ERROR: Invalid password.\n";
+                *err_msg = "ERROR: Invalid ID/Password.\n";
                 return false;
         }
 

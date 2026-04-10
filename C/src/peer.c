@@ -105,7 +105,7 @@ static int32_t connect_to_rendezvous(
         sa.sin_addr.s_addr     = inet_addr(cfg->server_ip);
         sa.sin_port            = htons(cfg->server_port);
 
-        printf("Connecting to rendezvous server %s:%d ...\n",
+        printf("INFO: Connecting to rendezvous server %s:%d ...\n",
                cfg->server_ip, cfg->server_port);
 
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
@@ -114,7 +114,7 @@ static int32_t connect_to_rendezvous(
                 return -1;
         }
 
-        printf("Connected.\n");
+        printf("SUCCESS: Connected.\n");
         return fd;
 }
 
@@ -142,11 +142,11 @@ static bool do_rendezvous_exchange(
         for (;;) {
                 char *msg = NULL;
                 if (!crypto_recv_decrypt(rendezvous_fd, &msg, s)) {
-                        printf("\nConnection to rendezvous server closed.\n");
+                        printf("\nERROR: Connection to rendezvous server closed.\n");
                         return false;
                 }
 
-                printf("%s", msg);
+                printf("RENDEZVOUS: %s", msg);
                 fflush(stdout);
 
                 if (strstr(msg, "ERROR")) {
@@ -168,7 +168,7 @@ static bool do_rendezvous_exchange(
                          * Server is asking for our P2P public key.
                          * Send it as a raw encrypted binary blob.
                          */
-                        printf("\n[Sending P2P public key to rendezvous...]\n");
+                        printf("\nINFO: Sending P2P public key to rendezvous...\n");
                         if (!crypto_encrypt_send_bin(rendezvous_fd,
                                          my_kp->pub,
                                          crypto_kx_PUBLICKEYBYTES, s))
@@ -216,7 +216,7 @@ static int32_t do_hole_punch(
         pa.sin_addr.s_addr      = inet_addr(peer->ip);
         pa.sin_port             = htons(peer->port);
 
-        printf("Initiating TCP hole punch to %s:%d...\n",
+        printf("INFO: Initiating TCP hole punch to %s:%d...\n",
                peer->ip, peer->port);
 
         for (int i = 0; i < max_attempts; i++) {
@@ -227,7 +227,7 @@ static int32_t do_hole_punch(
                         return fd;
 
                 close(fd);
-                printf("Punch attempt %d failed. Retrying in 1s...\n", i + 1);
+                printf("WARNING: Punch attempt %d failed. Retrying in 1s...\n", i + 1);
                 sleep(1);
         }
 
@@ -254,7 +254,7 @@ int main(int argc, char **argv)
          */
         Keypair my_kp;
         crypto_gen_keypair(&my_kp);
-        printf("Generated P2P keypair.\n");
+        printf("INFO: Generated P2P keypair.\n");
 
         struct sockaddr_in local_addr = {0};
         local_addr.sin_family          = AF_INET;
@@ -275,7 +275,7 @@ int main(int argc, char **argv)
                 close(rendezvous_fd);
                 return 1;
         }
-        printf("Secure channel with rendezvous established.\n");
+        printf("SUCCESS: Secure channel with rendezvous established.\n");
 
         /* run the rendezvous protocol — get peer's IP:Port and public key */
         PeerInfo peer         = {0};
@@ -303,9 +303,7 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        printf("\n===========================\n");
-        printf("SUCCESS! P2P CONNECTION ESTABLISHED!");
-        printf("\n===========================\n\n");
+        printf("SUCCESS: P2P connection established!");
 
         /*
          * Derive the P2P session keys from our keypair and the peer's public
@@ -321,10 +319,11 @@ int main(int argc, char **argv)
                 close(p2p_fd);
                 return 1;
         }
+        printf("SUCCESS: P2P E2EE established!");
 
         /* demo: exchange names over the encrypted P2P channel */
         char my_name[64];
-        printf("Enter your name: ");
+        printf("INPUT: Enter your name: ");
         fflush(stdout);
         if (fgets(my_name, sizeof(my_name) - 1, stdin) == NULL) {
                 close(p2p_fd);
