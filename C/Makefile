@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2
 LIBS    = -lsodium
 
-SHARED_SRC  = src/crypto.c src/net.c
+SHARED_SRC  = src/crypto.c src/net.c src/logger.c
 SHARED_OBJ  = $(SHARED_SRC:.c=.o)
 
 PEER_SRC    	= $(SHARED_SRC) src/peer.c

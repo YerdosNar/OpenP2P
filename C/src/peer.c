@@ -13,6 +13,7 @@
 
 #include "../include/crypto.h"
 #include "../include/net.h"
+#include "../include/logger.h"
 
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
@@ -114,16 +115,16 @@ static int32_t connect_to_rendezvous(
         sa.sin_addr.s_addr     = inet_addr(cfg->server_ip);
         sa.sin_port            = htons(cfg->server_port);
 
-        printf("INFO: Connecting to rendezvous server %s:%d ...\n",
+        info("Connecting to rendezvous server %s:%d ...\n",
                cfg->server_ip, cfg->server_port);
 
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                fprintf(stderr, "ERROR: Connection to rendezvous server failed.\n");
+                err("Connection to rendezvous server failed.\n");
                 close(fd);
                 return -1;
         }
 
-        printf("SUCCESS: Connected.\n");
+        success("Connected.\n");
         return fd;
 }
 
@@ -151,11 +152,11 @@ static bool do_rendezvous_exchange(
         for (;;) {
                 char *msg = NULL;
                 if (!crypto_recv_decrypt(rendezvous_fd, &msg, s)) {
-                        printf("\nERROR: Connection to rendezvous server closed.\n");
+                        err("Connection to rendezvous server closed.\n");
                         return false;
                 }
 
-                printf("RENDEZVOUS: %s", msg);
+                printf(BCYN "RENDEZVOUS:" NOC " %s", msg);
                 fflush(stdout);
 
                 if (strstr(msg, "ERROR")) {
@@ -177,7 +178,8 @@ static bool do_rendezvous_exchange(
                          * Server is asking for our P2P public key.
                          * Send it as a raw encrypted binary blob.
                          */
-                        printf("\nINFO: Sending P2P public key to rendezvous...\n");
+                        printf("\n");
+                        info("Sending P2P public key to rendezvous...\n");
                         if (!crypto_encrypt_send_bin(rendezvous_fd,
                                          my_kp->pub,
                                          crypto_kx_PUBLICKEYBYTES, s))
@@ -198,8 +200,7 @@ static bool do_rendezvous_exchange(
                         if (!crypto_recv_decrypt_bin(rendezvous_fd, &pub, &plen, s)
                             || plen != crypto_kx_PUBLICKEYBYTES)
                         {
-                                fprintf(stderr,
-                                        "ERROR: Bad peer public key from rendezvous.\n");
+                                err("Bad peer public key from rendezvous.\n");
                                 free(pub);
                                 return false;
                         }
@@ -225,7 +226,7 @@ static int32_t do_hole_punch(
         pa.sin_addr.s_addr      = inet_addr(peer->ip);
         pa.sin_port             = htons(peer->port);
 
-        printf("INFO: Initiating TCP hole punch to %s:%d...\n",
+        info("Initiating TCP hole punch to %s:%d...\n",
                peer->ip, peer->port);
 
         for (int i = 0; i < max_attempts; i++) {
@@ -236,7 +237,7 @@ static int32_t do_hole_punch(
                         return fd;
 
                 close(fd);
-                printf("WARNING: Punch attempt %d failed. Retrying in 1s...\n", i + 1);
+                warn("Punch attempt %d failed. Retrying in 1s...\n", i + 1);
                 sleep(1);
         }
 
@@ -308,11 +309,11 @@ static void send_loop(ChatCtx *ctx)
 int main(int argc, char **argv)
 {
         Config cfg = parse_args(argc, argv);
-        printf("INFO: Rendezvous %s:%d | Local port %d\n",
+        info("Rendezvous %s:%d | Local port %d\n",
                cfg.server_ip, cfg.server_port, cfg.local_port);
 
         if (sodium_init() < 0) {
-                fprintf(stderr, "ERROR: libsodium init failed.\n");
+                err("libsodium init failed.\n");
                 return 1;
         }
 
@@ -323,7 +324,7 @@ int main(int argc, char **argv)
          */
         Keypair my_kp;
         crypto_gen_keypair(&my_kp);
-        printf("INFO: Generated P2P keypair.\n");
+        info("Generated P2P keypair.\n");
 
         struct sockaddr_in local_addr = {0};
         local_addr.sin_family          = AF_INET;
@@ -339,12 +340,12 @@ int main(int argc, char **argv)
 
         Session rs = {0};
         if (!crypto_do_key_exchange(rendezvous_fd, &rs)) {
-                fprintf(stderr, "ERROR: Key exchange with rendezvous failed.\n");
+                err("Key exchange with rendezvous failed.\n");
                 sodium_memzero(&my_kp, sizeof(my_kp));
                 close(rendezvous_fd);
                 return 1;
         }
-        printf("SUCCESS: Secure channel with rendezvous established.\n");
+        success("Secure channel with rendezvous established.\n");
 
         /* run the rendezvous protocol — get peer's IP:Port and public key */
         PeerInfo peer         = {0};
@@ -364,15 +365,14 @@ int main(int argc, char **argv)
         /* TCP hole punch */
         int32_t p2p_fd = do_hole_punch(&peer, &local_addr, 15);
         if (p2p_fd == -1) {
-                fprintf(stderr,
-                        "ERROR: Hole punch failed after 15 attempts."
+                err("ROR: Hole punch failed after 15 attempts."
                         " NAT may be too strict.\n");
                 free(peer_pub_key);
                 sodium_memzero(&my_kp, sizeof(my_kp));
                 return 1;
         }
 
-        printf("SUCCESS: P2P connection established!\n");
+        success("P2P connection established!\n");
 
         /*
          * Derive the P2P session keys from our keypair and the peer's public
@@ -388,11 +388,11 @@ int main(int argc, char **argv)
                 close(p2p_fd);
                 return 1;
         }
-        printf("SUCCESS: P2P E2EE established!\n");
+        success("P2P E2EE established!\n");
 
         /* exchange names over the encrypted P2P channel */
         char my_name[64];
-        printf("INPUT: Enter your name: ");
+        printf(BMGN "INPUT" NOC ": Enter your name: ");
         fflush(stdout);
         if (fgets(my_name, sizeof(my_name) - 1, stdin) == NULL) {
                 close(p2p_fd);
@@ -401,18 +401,18 @@ int main(int argc, char **argv)
         net_strip_newline(my_name);
 
         if (!crypto_encrypt_send(p2p_fd, my_name, &ps)) {
-                fprintf(stderr, "ERROR: Could not send name.\n");
+                err("Could not send name.\n");
                 close(p2p_fd);
                 return 1;
         }
-        printf("INFO: Sent my name: '%s'.\n", my_name);
+        info("Sent my name: '%s'.\n", my_name);
 
         char *peer_name = NULL;
         if (!crypto_recv_decrypt(p2p_fd, &peer_name, &ps)) {
                 close(p2p_fd);
                 return 1;
         }
-        printf("INFO: Received peer's name: '%s'.\n", peer_name);
+        info("Received peer's name: '%s'.\n", peer_name);
 
         printf("\n======================================================\n");
         printf("  Your legendary chat with '%s' begins here!", peer_name);
@@ -429,7 +429,7 @@ int main(int argc, char **argv)
 
         pthread_t rtid;
         if (pthread_create(&rtid, NULL, recv_thread, &chat) != 0) {
-                fprintf(stderr, "ERROR: pthread_create() failed.\n");
+                err("pthread_create() failed.\n");
                 close(p2p_fd);
                 free(peer_name);
                 return 1;

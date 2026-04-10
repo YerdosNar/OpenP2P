@@ -1,4 +1,5 @@
 #include "../include/room.h"
+#include "../include/logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,6 +182,6 @@ void room_print_stats(RoomTable *rt)
         for (uint32_t i = 0; i < rt->max_rooms; i++) {
                 if (rt->rooms[i].is_active) active++;
         }
-        printf("INFO: Active rooms: %u / %u\n", active, rt->max_rooms);
+        info("Active rooms: %u / %u\n", active, rt->max_rooms);
         pthread_mutex_unlock(&rt->lock);
 }

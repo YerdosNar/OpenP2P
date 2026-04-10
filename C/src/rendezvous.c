@@ -13,6 +13,7 @@
 #include "../include/crypto.h"
 #include "../include/net.h"
 #include "../include/room.h"
+#include "../include/logger.h"
 
 #define DEFAULT_PORT        8888
 #define DEFAULT_LOG_FILE    "con.log"
@@ -49,7 +50,7 @@ static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
         size_t send_len = strlen(prompt) + 9;
         char  *tagged   = malloc(send_len);
         if (!tagged) return NULL;
-        snprintf(tagged, send_len, "INPUT: %s ", prompt);
+        snprintf(tagged, send_len, BMGN "INPUT" NOC ": %s ", prompt);
 
         if (!crypto_encrypt_send(fd, tagged, s)) {
                 free(tagged);
@@ -89,13 +90,13 @@ static void handle_host(ClientCtx *ctx, const Session *s)
                 if (!id) return;
 
                 if (strlen(id) == 0) {
-                        send_msg(fd, "INPUT: ID cannot be empty. Try again: ", s);
+                        send_msg(fd, BMGN "INPUT" NOC ": ID cannot be empty. Try again: ", s);
                         free(id);
                         continue;
                 }
                 if (room_id_exists(rt, id)) {
                         send_msg(fd,
-                                 "INPUT: That ID is already in use. Choose another: ",
+                                 BMGN "INPUT" NOC ": That ID is already in use. Choose another: ",
                                  s);
                         free(id);
                         continue;
@@ -114,7 +115,7 @@ static void handle_host(ClientCtx *ctx, const Session *s)
         if (!crypto_recv_decrypt_bin(fd, &pub_key, &pub_len, s)
             || pub_len != crypto_kx_PUBLICKEYBYTES)
         {
-                fprintf(stderr, "ERROR: Bad public key from host.\n");
+                err("Bad public key from host.\n");
                 free(pub_key); free(id); free(pw);
                 close(fd);
                 return;
@@ -174,7 +175,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
         if (!crypto_recv_decrypt_bin(fd, &joiner_pub, &joiner_pub_len, s)
             || joiner_pub_len != crypto_kx_PUBLICKEYBYTES)
         {
-                fprintf(stderr, "ERROR: Bad public key from joiner.\n");
+                err("Bad public key from joiner.\n");
                 free(joiner_pub); free(id); free(pw);
                 close(fd);
                 return;
@@ -201,7 +202,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
                 return;
         }
 
-        printf("INFO: Room claimed. Distributing peer info.  [%s:%d]\n",
+        info("Room claimed. Distributing peer info.  [%s:%d]\n",
                ctx->peer_ip, ctx->peer_port);
 
         /* build IP:Port strings */
@@ -225,7 +226,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
         crypto_encrypt_send_bin(fd, host_pub,
                                 crypto_kx_PUBLICKEYBYTES, s);
 
-        printf("INFO: Handshake complete. Tearing down rendezvous for room '%s'.\n", id);
+        info("Handshake complete. Tearing down rendezvous for room '%s'.\n", id);
 
         free(id);
         free(pw);
@@ -249,19 +250,19 @@ static void *client_thread(void *arg)
 
         Session s = {0};
         if (!crypto_do_key_exchange(ctx->client_fd, &s)) {
-                fprintf(stderr, "WARNING: Key exchange failed with %s:%d.\n",
+                warn("Key exchange failed with %s:%d.\n",
                         ctx->peer_ip, ctx->peer_port);
                 close(ctx->client_fd);
                 goto done;
         }
-        printf("SUCCESS: Secure channel established with %s:%d.\n",
+        success("Secure channel established with %s:%d.\n",
                ctx->peer_ip, ctx->peer_port);
 
         char *choice = ask_n_receive(
                 "Are you [H]ost or [J]oin? [h/j]: ",
                 ctx->client_fd, &s);
         if (!choice) {
-                fprintf(stderr, "WARNING: Peer disconnected before answering.\n");
+                warn("Peer disconnected before answering.\n");
                 close(ctx->client_fd);
                 goto done;
         }
@@ -273,7 +274,7 @@ static void *client_thread(void *arg)
                 handle_joiner(ctx, &s);
         }
         else {
-                send_msg(ctx->client_fd, "ERROR: Invalid selection.\n", &s);
+                err("Invalid selection.\n", &s);
                 close(ctx->client_fd);
         }
 
@@ -299,21 +300,21 @@ int main(int argc, char **argv)
                     || !strncmp(argv[i], "--port", 6))
                 {
                         if (i + 1 < argc) listen_port = (uint16_t)atoi(argv[++i]);
-                        else printf("WARNING: No port provided. Default: '%d'\n",
+                        warn("No port provided. Default: '%d'\n",
                                     DEFAULT_PORT);
                 }
                 else if (!strncmp(argv[i], "-l", 2)
                          || !strncmp(argv[i], "--log", 5))
                 {
                         if (i + 1 < argc) log_filename = argv[++i];
-                        else printf("WARNING: No filename provided. Default: '%s'\n",
+                        warn("No filename provided. Default: '%s'\n",
                                     DEFAULT_LOG_FILE);
                 }
                 else if (!strncmp(argv[i], "-m", 2)
                          || !strncmp(argv[i], "--max-rooms", 11))
                 {
                         if (i + 1 < argc) max_rooms = (uint32_t)atoi(argv[++i]);
-                        else printf("WARNING: No number provided. Default: %d\n",
+                        warn("No number provided. Default: %d\n",
                                     MAX_ROOMS);
                 }
                 else if (!strncmp(argv[i], "-h", 2)
@@ -323,24 +324,24 @@ int main(int argc, char **argv)
                 }
         }
 
-        printf("INFO: Port=%d  Log=%s  MaxRooms=%u\n",
+        info("Port=%d  Log=%s  MaxRooms=%u\n",
                listen_port, log_filename, max_rooms);
 
         if (sodium_init() < 0) {
-                fprintf(stderr, "ERROR: libsodium init failed.\n");
+                err("libsodium init failed.\n");
                 return 1;
         }
 
         int32_t server_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd == -1) {
-                fprintf(stderr, "ERROR: socket() failed.\n");
+                err("socket() failed.\n");
                 return 1;
         }
 
         int32_t opt = 1;
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
                        &opt, sizeof(opt)) == -1) {
-                fprintf(stderr, "ERROR: setsockopt() failed.\n");
+                err("setsockopt() failed.\n");
                 return 1;
         }
 
@@ -350,19 +351,19 @@ int main(int argc, char **argv)
         sa.sin_port            = htons(listen_port);
 
         if (bind(server_fd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
-                fprintf(stderr, "ERROR: bind() failed.\n");
+                err("bind() failed.\n");
                 return 1;
         }
         if (listen(server_fd, 128) == -1) {
-                fprintf(stderr, "ERROR: listen() failed.\n");
+                err("listen() failed.\n");
                 return 1;
         }
 
-        printf("INFO: Rendezvous server listening on port %d...\n", listen_port);
+        info("Rendezvous server listening on port %d...\n", listen_port);
 
         RoomTable rt;
         if (!room_table_init(&rt, max_rooms)) {
-                fprintf(stderr, "ERROR: room_table_init() failed.\n");
+                err("room_table_init() failed.\n");
                 close(server_fd);
                 return 1;
         }
@@ -374,13 +375,13 @@ int main(int argc, char **argv)
                 int32_t client_fd = accept(server_fd,
                                            (struct sockaddr *)&ca, &ca_len);
                 if (client_fd == -1) {
-                        fprintf(stderr, "WARNING: accept() failed, skipping.\n");
+                        warn("accept() failed, skipping.\n");
                         continue;
                 }
 
                 ClientCtx *ctx = malloc(sizeof(*ctx));
                 if (!ctx) {
-                        fprintf(stderr, "ERROR: malloc failed for ClientCtx.\n");
+                        err("malloc failed for ClientCtx.\n");
                         close(client_fd);
                         continue;
                 }
@@ -392,7 +393,7 @@ int main(int argc, char **argv)
 
                 pthread_t tid;
                 if (pthread_create(&tid, NULL, client_thread, ctx) != 0) {
-                        fprintf(stderr, "ERROR: pthread_create failed.\n");
+                        err("pthread_create failed.\n");
                         close(client_fd);
                         free(ctx);
                         continue;
