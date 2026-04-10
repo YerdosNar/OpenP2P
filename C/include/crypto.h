@@ -45,7 +45,7 @@ void crypto_gen_keypair(Keypair *kp);
 /*
  * Derive a Session from a local Keypair and the peer's raw public key.
  * Roles (client / server) are decided by lexicographic key comparison,
- * exactly as in crypto_do_key_exchange() so both sides coverge on the
+ * exactly as in crypto_do_key_exchange() so both sides converge on the
  * same rx/tx assignment without any extra negotiation.
  *
  * Returns true on success.

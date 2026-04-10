@@ -5,8 +5,8 @@ LIBS    = -lsodium
 SHARED_SRC  = src/crypto.c src/net.c
 SHARED_OBJ  = $(SHARED_SRC:.c=.o)
 
-PEER_SRC    = src/peer.c $(SHARED_SRC)
-RENDEZVOUS_SRC = src/rendezvous.c src/room.c $(SHARED_SRC)
+PEER_SRC    	= $(SHARED_SRC) src/peer.c
+RENDEZVOUS_SRC 	= $(SHARED_SRC) src/rendezvous.c src/room.c src/avl.c
 
 .PHONY: all clean
 
