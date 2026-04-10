@@ -201,7 +201,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
                 return;
         }
 
-        printf("Room claimed. Distributing peer info.  [%s:%d]\n",
+        printf("INFO: Room claimed. Distributing peer info.  [%s:%d]\n",
                ctx->peer_ip, ctx->peer_port);
 
         /* build IP:Port strings */
@@ -225,7 +225,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
         crypto_encrypt_send_bin(fd, host_pub,
                                 crypto_kx_PUBLICKEYBYTES, s);
 
-        printf("Handshake complete. Tearing down rendezvous for room '%s'.\n", id);
+        printf("INFO: Handshake complete. Tearing down rendezvous for room '%s'.\n", id);
 
         free(id);
         free(pw);
@@ -254,7 +254,7 @@ static void *client_thread(void *arg)
                 close(ctx->client_fd);
                 goto done;
         }
-        printf("Secure channel established with %s:%d.\n",
+        printf("SUCCESS: Secure channel established with %s:%d.\n",
                ctx->peer_ip, ctx->peer_port);
 
         char *choice = ask_n_receive(

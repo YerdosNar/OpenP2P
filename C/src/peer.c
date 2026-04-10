@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -27,6 +28,14 @@ typedef struct {
         char     ip[MAX_IP_LEN];
         uint16_t port;
 } PeerInfo;
+
+typedef struct {
+        int32_t         fd;
+        const Session   *session;
+        const char      *my_name;
+        const char      *peer_name;
+        volatile bool  running;
+} ChatCtx;
 
 static void resolve_domain(const char *domain, char *out_ip)
 {
@@ -234,6 +243,66 @@ static int32_t do_hole_punch(
         return -1;
 }
 
+static  void *recv_thread(void *arg)
+{
+        ChatCtx *ctx = arg;
+
+        while (ctx->running) {
+                char *peer_msg = NULL;
+                if (!crypto_recv_decrypt(ctx->fd, &peer_msg, ctx->session)) {
+                        if (ctx->running) {
+                                ctx->running = false;
+                                printf("\n[%s disconnected.]\n", ctx->peer_name);
+                                shutdown(ctx->fd, SHUT_RDWR);
+                        }
+                        break;
+                }
+                /*
+                 * Erase the current input prompt, print the incoming message,
+                 * then reprint the prompt so the user can keep typing.
+                 *
+                 * \r          = move cursor to column 0
+                 * \033[2K     = clear entire current line
+                 */
+                printf("\r\033[2K%s: %s\n%s: ",
+                       ctx->peer_name, peer_msg, ctx->my_name);
+                fflush(stdout);
+                free(peer_msg);
+        }
+
+        return NULL;
+}
+
+static void send_loop(ChatCtx *ctx)
+{
+        char message[1024];
+
+        while (ctx->running) {
+                printf("%s: ", ctx->my_name);
+                fflush(stdout);
+
+                if (fgets(message, sizeof(message), stdin) == NULL) {
+                        ctx->running = false;
+                        printf("\n[You left the chat.]\n");
+                        shutdown(ctx->fd, SHUT_RDWR);
+                        break;
+                }
+                net_strip_newline(message);
+
+                if (message[0] == '\0') continue;
+
+                if (!ctx->running) break;
+
+                if (!crypto_encrypt_send(ctx->fd, message, ctx->session)) {
+                        if (ctx->running) {
+                                ctx->running = false;
+                                fprintf(stderr, "\n[Connection lost.]\n");
+                        }
+                        break;
+                }
+        }
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -303,7 +372,7 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        printf("SUCCESS: P2P connection established!");
+        printf("SUCCESS: P2P connection established!\n");
 
         /*
          * Derive the P2P session keys from our keypair and the peer's public
@@ -319,9 +388,9 @@ int main(int argc, char **argv)
                 close(p2p_fd);
                 return 1;
         }
-        printf("SUCCESS: P2P E2EE established!");
+        printf("SUCCESS: P2P E2EE established!\n");
 
-        /* demo: exchange names over the encrypted P2P channel */
+        /* exchange names over the encrypted P2P channel */
         char my_name[64];
         printf("INPUT: Enter your name: ");
         fflush(stdout);
@@ -347,31 +416,32 @@ int main(int argc, char **argv)
 
         printf("\n======================================================\n");
         printf("  Your legendary chat with '%s' begins here!", peer_name);
-        printf("\n======================================================\n");
+        printf("\n  (type a message and press Enter - Ctrl-D to quit)");
+        printf("\n======================================================\n\n");
 
-        for (;;) {
-                char message[1024];
-                printf("%s: ", my_name);
-                if (fgets(message, sizeof(message) - 1, stdin) == NULL) {
-                        close(p2p_fd);
-                        return 1;
-                }
-                net_strip_newline(message);
+        ChatCtx chat = {
+                .fd             = p2p_fd,
+                .session        = &ps,
+                .my_name        = my_name,
+                .peer_name      = peer_name,
+                .running        = true,
+        };
 
-                if (!crypto_encrypt_send(p2p_fd, message, &ps)) {
-                        fprintf(stderr, "ERROR: Could not send message.\n");
-                        close(p2p_fd);
-                        return 1;
-                }
-
-                char *peer_msg = NULL;
-                if (!crypto_recv_decrypt(p2p_fd, &peer_msg, &ps)) {
-                        close(p2p_fd);
-                        return 1;
-                }
-                printf("%s: '%s'.\n", peer_name, peer_msg);
+        pthread_t rtid;
+        if (pthread_create(&rtid, NULL, recv_thread, &chat) != 0) {
+                fprintf(stderr, "ERROR: pthread_create() failed.\n");
+                close(p2p_fd);
+                free(peer_name);
+                return 1;
         }
 
+        /* sender runs on the main thread (needs stdin) */
+        send_loop(&chat);
+
+        /* wait for the receiver to finish */
+        pthread_join(rtid, NULL);
+
+        /* cleanup */
         free(peer_name);
         sodium_memzero(&ps, sizeof(ps));
         close(p2p_fd);
