@@ -50,7 +50,7 @@ static char *ask_n_receive(const char *prompt, int32_t fd, const Session *s)
         size_t send_len = strlen(prompt) + 9;
         char  *tagged   = malloc(send_len);
         if (!tagged) return NULL;
-        snprintf(tagged, send_len, BMGN "INPUT" NOC ": %s ", prompt);
+        snprintf(tagged, send_len, "INPUT: %s ", prompt);
 
         if (!crypto_encrypt_send(fd, tagged, s)) {
                 free(tagged);
@@ -86,17 +86,17 @@ static void handle_host(ClientCtx *ctx, const Session *s)
 
         char *id = NULL;
         for (;;) {
-                id = ask_n_receive("HostRoom ID (7 chars): ", fd, s);
+                id = ask_n_receive("HostRoom ID (7 chars):", fd, s);
                 if (!id) return;
 
                 if (strlen(id) == 0) {
-                        send_msg(fd, BMGN "INPUT" NOC ": ID cannot be empty. Try again: ", s);
+                        send_msg(fd, "INPUT: ID cannot be empty. Try again:", s);
                         free(id);
                         continue;
                 }
                 if (room_id_exists(rt, id)) {
                         send_msg(fd,
-                                 BMGN "INPUT" NOC ": That ID is already in use. Choose another: ",
+                                 "INPUT: That ID is already in use. Choose another:",
                                  s);
                         free(id);
                         continue;
@@ -104,7 +104,7 @@ static void handle_host(ClientCtx *ctx, const Session *s)
                 break;
         }
 
-        char *pw = ask_n_receive("HostRoom password (7 chars): ", fd, s);
+        char *pw = ask_n_receive("HostRoom PW (7 chars):", fd, s);
         if (!pw) { free(id); return; }
 
         /* ask the host to send its P2P public key */
@@ -160,11 +160,11 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
         RoomTable *rt = ctx->rt;
 
         /* 1 - room ID */
-        char *id = ask_n_receive("HostRoom ID (case sensitive): ", fd, s);
+        char *id = ask_n_receive("HostRoom ID (case sensitive):", fd, s);
         if (!id) return;
 
         /* 2 - password */
-        char *pw = ask_n_receive("HostRoom password (case sensitive): ", fd, s);
+        char *pw = ask_n_receive("HostRoom PW (case sensitive):", fd, s);
         if (!pw) { free(id); close(fd); return; }
 
         /* 3 - joiner public key */
@@ -202,7 +202,7 @@ static void handle_joiner(ClientCtx *ctx, const Session *s)
                 return;
         }
 
-        info("Room claimed. Distributing peer info.  [%s:%d]\n",
+        info("Room claimed. Distributing peer info. [%s:%d]\n",
                ctx->peer_ip, ctx->peer_port);
 
         /* build IP:Port strings */
@@ -259,7 +259,7 @@ static void *client_thread(void *arg)
                ctx->peer_ip, ctx->peer_port);
 
         char *choice = ask_n_receive(
-                "Are you [H]ost or [J]oin? [h/j]: ",
+                "Are you [H]ost or [J]oin? [h/j]:",
                 ctx->client_fd, &s);
         if (!choice) {
                 warn("Peer disconnected before answering.\n");
@@ -300,21 +300,21 @@ int main(int argc, char **argv)
                     || !strncmp(argv[i], "--port", 6))
                 {
                         if (i + 1 < argc) listen_port = (uint16_t)atoi(argv[++i]);
-                        warn("No port provided. Default: '%d'\n",
+                        else warn("No port provided. Default: '%d'\n",
                                     DEFAULT_PORT);
                 }
                 else if (!strncmp(argv[i], "-l", 2)
                          || !strncmp(argv[i], "--log", 5))
                 {
                         if (i + 1 < argc) log_filename = argv[++i];
-                        warn("No filename provided. Default: '%s'\n",
+                        else warn("No filename provided. Default: '%s'\n",
                                     DEFAULT_LOG_FILE);
                 }
                 else if (!strncmp(argv[i], "-m", 2)
                          || !strncmp(argv[i], "--max-rooms", 11))
                 {
                         if (i + 1 < argc) max_rooms = (uint32_t)atoi(argv[++i]);
-                        warn("No number provided. Default: %d\n",
+                        else warn("No number provided. Default: %d\n",
                                     MAX_ROOMS);
                 }
                 else if (!strncmp(argv[i], "-h", 2)

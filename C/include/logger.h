@@ -12,8 +12,8 @@
 #define  GRN "\033[32m"
 #define  YEL "\033[33m"
 #define  BLU "\033[34m"
-#define  MGN "\033[45m"
-#define  CYN "\033[46m"
+#define  MGN "\033[35m"
+#define  CYN "\033[36m"
 
 #define NOC "\033[0m"
 

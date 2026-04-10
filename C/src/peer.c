@@ -115,8 +115,7 @@ static int32_t connect_to_rendezvous(
         sa.sin_addr.s_addr     = inet_addr(cfg->server_ip);
         sa.sin_port            = htons(cfg->server_port);
 
-        info("Connecting to rendezvous server %s:%d ...\n",
-               cfg->server_ip, cfg->server_port);
+        info("Connecting...\n");
 
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
                 err("Connection to rendezvous server failed.\n");
@@ -124,7 +123,12 @@ static int32_t connect_to_rendezvous(
                 return -1;
         }
 
-        success("Connected.\n");
+        success("Connected to rendezvous server "
+                MGN "%s"
+                NOC ":"
+                CYN "%d"
+                NOC "...\n",
+               cfg->server_ip, cfg->server_port);
         return fd;
 }
 
@@ -190,7 +194,11 @@ static bool do_rendezvous_exchange(
                 }
                 /* peer IP:Port — next message will be their public key */
                 else if (sscanf(msg, "%15[^:]:%hu", peer->ip, &peer->port) == 2) {
-                        printf("\n>>> Target peer: %s:%d <<<\n",
+                        printf("\n>>> Target peer: "
+                               MGN "%s"
+                               NOC ":"
+                               CYN "%d"
+                               NOC " <<<\n",
                                peer->ip, peer->port);
                         free(msg);
 
@@ -205,7 +213,7 @@ static bool do_rendezvous_exchange(
                                 return false;
                         }
 
-                        printf("[Received peer P2P public key from rendezvous.]\n");
+                        info("Received peer P2P public key from rendezvous.]\n");
                         *peer_pub_out = pub;
                         return true;
                 }
@@ -226,8 +234,12 @@ static int32_t do_hole_punch(
         pa.sin_addr.s_addr      = inet_addr(peer->ip);
         pa.sin_port             = htons(peer->port);
 
-        info("Initiating TCP hole punch to %s:%d...\n",
-               peer->ip, peer->port);
+        info("Initiating TCP hole punch to "
+                               MGN "%s"
+                               NOC ":"
+                               CYN "%d"
+                               NOC "...\n",
+                               peer->ip, peer->port);
 
         for (int i = 0; i < max_attempts; i++) {
                 int32_t fd = net_make_bound_socket(local_addr);
@@ -237,7 +249,7 @@ static int32_t do_hole_punch(
                         return fd;
 
                 close(fd);
-                warn("Punch attempt %d failed. Retrying in 1s...\n", i + 1);
+                warn("Punch attempt " YEL "%d" NOC " failed. Retrying in 1s...\n", i + 1);
                 sleep(1);
         }
 
@@ -309,7 +321,12 @@ static void send_loop(ChatCtx *ctx)
 int main(int argc, char **argv)
 {
         Config cfg = parse_args(argc, argv);
-        info("Rendezvous %s:%d | Local port %d\n",
+        info("Rendezvous "
+                MGN "%s"
+                NOC ":"
+                CYN "%d"
+                NOC "| Local port "
+                CYN "%d\n" NOC,
                cfg.server_ip, cfg.server_port, cfg.local_port);
 
         if (sodium_init() < 0) {

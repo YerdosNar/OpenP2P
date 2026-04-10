@@ -34,11 +34,11 @@ bool crypto_derive_session(
 	if (cmp < 0) {
 		ret = crypto_kx_client_session_keys(
 			s->rx, s->tx, kp->pub, kp->sec, peer_pub);
-		info("P2P key-derivation role: CLIENT\n");
+		info("P2P key-derivation role: " MGN "CLIENT\n" NOC);
 	} else {
 		ret = crypto_kx_server_session_keys(
 			s->rx, s->tx, kp->pub, kp->sec, peer_pub);
-		info("P2P key-derivation role: SERVER\n");
+		info("P2P key-derivation role: " MGN "SERVER\n" NOC);
 	}
 
 	if (ret != 0) {
