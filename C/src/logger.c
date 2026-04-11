@@ -37,7 +37,7 @@ void err(const char *msg, ...) {
         va_list args;
         va_start(args, msg);
 
-        printf(BRED "[x]" NOC " ");
+        fprintf(stderr, BRED "[x]" NOC " ");
         vprintf(msg, args);
 
         va_end(args);
