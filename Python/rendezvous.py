@@ -5,7 +5,7 @@ import ssl
 HOST = "0.0.0.0"
 PORT = 5000
 
-rooms = {}  # {room_id: {"password": str, "addr": tuple, "conn": conn}}
+rooms = {}
 rooms_lock = threading.Lock()
 
 
@@ -45,7 +45,6 @@ def handle_client(conn, addr):
             print(f"[*] Room '{room_id}' created by {addr}")
             send(conn, f"Room '{room_id}' created. Waiting for someone to join...\n")
 
-            # Block until a joiner triggers the event or 3 min timeout
             joined = event.wait(timeout=180)
             if not joined:
                 send(conn, "Room expired. No one joined.\n")
@@ -73,13 +72,13 @@ def handle_client(conn, addr):
             host_info = f"{host_addr[0]}:{host_addr[1]}:{host_pubkey}"
             joiner_info = f"{addr[0]}:{addr[1]}:{pubkey_hex}"
 
-            send(conn, f"PEER_INFO:{host_info}")
-            send(host_conn, f"PEER_INFO:{joiner_info}")
+            send(conn, f"PEER_INFO:{host_info}\n")
+            send(host_conn, f"PEER_INFO:{joiner_info}\n")
 
             print(f"[*] Exchanged info between {host_addr} and {addr}")
 
-            room["event"].set()  # Wake up the host thread
-            room["conn"].close()
+            room["event"].set()
+            host_conn.close()
         else:
             send(conn, "Invalid choice\n")
 

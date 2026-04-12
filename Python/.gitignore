@@ -1,3 +1,5 @@
 server.*
 venv/*
 venv/
+test/*
+test/
