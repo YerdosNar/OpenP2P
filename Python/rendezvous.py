@@ -2,9 +2,9 @@ import socket
 import threading
 
 HOST = "0.0.0.0"
-PORT = 8888
+PORT = 5000
 
-rooms = {}
+rooms = {}  # {room_id: {"password": str, "addr": tuple, "conn": conn}}
 rooms_lock = threading.Lock()
 
 
@@ -28,14 +28,24 @@ def handle_client(conn, addr):
             send(conn, "Enter HostRoom PW: ")
             room_pw = recv(conn)
 
+            event = threading.Event()
+
             with rooms_lock:
                 rooms[room_id] = {
                     "password": room_pw,
                     "addr": addr,
-                    "conn": conn
+                    "conn": conn,
+                    "event": event,
                 }
             print(f"[*] Room '{room_id}' created by {addr}")
             send(conn, f"Room '{room_id}' created. Waiting for someone to join...\n")
+
+            # Block until a joiner triggers the event or 3 min timeout
+            joined = event.wait(timeout=180)
+            if not joined:
+                send(conn, "Room expired. No one joined.\n")
+                with rooms_lock:
+                    rooms.pop(room_id, None)
 
         elif choice == "j":
             send(conn, "Enter HostRoom ID: ")
@@ -49,11 +59,19 @@ def handle_client(conn, addr):
                     send(conn, "Invalid ID or Password\n")
                     conn.close()
                     return
-
                 del rooms[room_id]
 
-            send(conn, "Matched! (details coming soon.)\n")
-            send(room["conn"], "Someone joined! (details coming soon)\n")
+            host_conn = room["conn"]
+            host_addr = room["addr"]
+
+            host_info = f"{host_addr[0]}:{host_addr[1]}:HOST_PUBLIC_KEY"
+            joiner_info = f"{addr[0]}:{addr[1]}:JOINER_PUBLIC_KEY"
+
+            send(conn, f"PEER_INFO:{host_info}")
+            send(host_conn, f"PEER_INFO:{joiner_info}")
+
+            print(f"[*] Exchanged info between {host_addr} and {addr}")
+            room["event"].set()  # Wake up the host thread
             room["conn"].close()
         else:
             send(conn, "Invalid choice\n")
