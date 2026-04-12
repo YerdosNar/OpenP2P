@@ -1,5 +1,6 @@
 import socket
 import threading
+import ssl
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -19,6 +20,9 @@ def recv(conn):
 def handle_client(conn, addr):
     print(f"[+] {addr} connected")
     try:
+        pubkey_hex = recv(conn)
+        print(f"[*] {addr} public key: {pubkey_hex}")
+
         send(conn, "Are you [H]ost or [J]oin [h/j]: ")
         choice = recv(conn).lower()
 
@@ -36,6 +40,7 @@ def handle_client(conn, addr):
                     "addr": addr,
                     "conn": conn,
                     "event": event,
+                    "pubkey": pubkey_hex,
                 }
             print(f"[*] Room '{room_id}' created by {addr}")
             send(conn, f"Room '{room_id}' created. Waiting for someone to join...\n")
@@ -63,14 +68,16 @@ def handle_client(conn, addr):
 
             host_conn = room["conn"]
             host_addr = room["addr"]
+            host_pubkey = room["pubkey"]
 
-            host_info = f"{host_addr[0]}:{host_addr[1]}:HOST_PUBLIC_KEY"
-            joiner_info = f"{addr[0]}:{addr[1]}:JOINER_PUBLIC_KEY"
+            host_info = f"{host_addr[0]}:{host_addr[1]}:{host_pubkey}"
+            joiner_info = f"{addr[0]}:{addr[1]}:{pubkey_hex}"
 
             send(conn, f"PEER_INFO:{host_info}")
             send(host_conn, f"PEER_INFO:{joiner_info}")
 
             print(f"[*] Exchanged info between {host_addr} and {addr}")
+
             room["event"].set()  # Wake up the host thread
             room["conn"].close()
         else:
@@ -88,10 +95,15 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen()
-    print(f"Rendezvous server listening on {HOST}:{PORT}")
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain("server.crt", "server.key")
+
+    print(f"Rendezvous server listening on {HOST}:{PORT} (TLS)")
 
     while True:
-        conn, addr = server.accept()
+        raw_conn, addr = server.accept()
+        conn = context.wrap_socket(raw_conn, server_side=True)
         thread = threading.Thread(target=handle_client, args=(conn, addr))
         thread.start()
 
