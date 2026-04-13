@@ -2,6 +2,8 @@ import socket
 import threading
 import ssl
 
+from logger import info, warn, error
+
 HOST = "0.0.0.0"
 PORT = 5000
 
@@ -17,76 +19,84 @@ def recv(conn):
     return conn.recv(1024).decode().strip()
 
 
+def handle_host(conn, addr, pubkey_hex):
+    send(conn, "Enter HostRoom ID: ")
+    room_id = recv(conn)
+    send(conn, "Enter HostRoom PW: ")
+    room_pw = recv(conn)
+
+    event = threading.Event()
+
+    with rooms_lock:
+        rooms[room_id] = {
+            "password": room_pw,
+            "addr": addr,
+            "conn": conn,
+            "event": event,
+            "pubkey": pubkey_hex
+        }
+    info(f"Room '{room_id}' created by {addr}")
+    send(conn, f"Room '{room_id}' created. Waiting for someone to join...\n")
+
+    joined = event.wait(timeout=180)
+    if not joined:
+        send(conn, "Room expired. No one joined.\n")
+        with rooms_lock:
+            rooms.pop(room_id, None)
+
+
+def handle_join(conn, addr, pubkey_hex):
+    send(conn, "Enter HostRoom ID: ")
+    room_id = recv(conn)
+    send(conn, "Enter HostRoom PW: ")
+    room_pw = recv(conn)
+
+    with rooms_lock:
+        room = rooms.get(room_id)
+        if room is None or room["password"] != room_pw:
+            send(conn, "Invalid ID or Password\n")
+            conn.close()
+            return
+        del rooms[room_id]
+
+    host_conn = room["conn"]
+    host_addr = room["addr"]
+    host_pubkey = room["pubkey"]
+
+    host_info = f"{host_addr[0]}:{host_addr[1]}:{host_pubkey}"
+    joiner_info = f"{addr[0]}:{addr[1]}:{pubkey_hex}"
+
+    send(conn, f"PEER_INFO:{host_info}\n")
+    send(host_conn, f"PEER_INFO:{joiner_info}\n")
+
+    info(f"Exchanged info between {host_addr} and {addr}")
+
+    room["event"].set()
+    host_conn.close()
+
+
 def handle_client(conn, addr):
-    print(f"[+] {addr} connected")
+    info(f"{addr} connected")
     try:
         pubkey_hex = recv(conn)
-        print(f"[*] {addr} public key: {pubkey_hex}")
+        info(f"{addr} shared public key")
 
         send(conn, "Are you [H]ost or [J]oin [h/j]: ")
         choice = recv(conn).lower()
 
         if choice == "h":
-            send(conn, "Enter HostRoom ID: ")
-            room_id = recv(conn)
-            send(conn, "Enter HostRoom PW: ")
-            room_pw = recv(conn)
-
-            event = threading.Event()
-
-            with rooms_lock:
-                rooms[room_id] = {
-                    "password": room_pw,
-                    "addr": addr,
-                    "conn": conn,
-                    "event": event,
-                    "pubkey": pubkey_hex,
-                }
-            print(f"[*] Room '{room_id}' created by {addr}")
-            send(conn, f"Room '{room_id}' created. Waiting for someone to join...\n")
-
-            joined = event.wait(timeout=180)
-            if not joined:
-                send(conn, "Room expired. No one joined.\n")
-                with rooms_lock:
-                    rooms.pop(room_id, None)
+            handle_host(conn, addr, pubkey_hex)
 
         elif choice == "j":
-            send(conn, "Enter HostRoom ID: ")
-            room_id = recv(conn)
-            send(conn, "Enter HostRoom PW: ")
-            room_pw = recv(conn)
-
-            with rooms_lock:
-                room = rooms.get(room_id)
-                if room is None or room["password"] != room_pw:
-                    send(conn, "Invalid ID or Password\n")
-                    conn.close()
-                    return
-                del rooms[room_id]
-
-            host_conn = room["conn"]
-            host_addr = room["addr"]
-            host_pubkey = room["pubkey"]
-
-            host_info = f"{host_addr[0]}:{host_addr[1]}:{host_pubkey}"
-            joiner_info = f"{addr[0]}:{addr[1]}:{pubkey_hex}"
-
-            send(conn, f"PEER_INFO:{host_info}\n")
-            send(host_conn, f"PEER_INFO:{joiner_info}\n")
-
-            print(f"[*] Exchanged info between {host_addr} and {addr}")
-
-            room["event"].set()
-            host_conn.close()
+            handle_join(conn, addr, pubkey_hex)
         else:
             send(conn, "Invalid choice\n")
 
     except Exception as e:
-        print(f"[!] Error with {addr}: {e}")
+        error(f"Error with {addr}: {e}")
     finally:
         conn.close()
-        print(f"[-] {addr} disconnected")
+        warn(f"{addr} disconnected")
 
 
 def main():
@@ -98,7 +108,7 @@ def main():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain("server.crt", "server.key")
 
-    print(f"Rendezvous server listening on {HOST}:{PORT} (TLS)")
+    info(f"Rendezvous server listening on {HOST}:{PORT} (TLS)")
 
     while True:
         raw_conn, addr = server.accept()
