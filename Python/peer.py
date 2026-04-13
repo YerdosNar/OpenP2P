@@ -267,7 +267,7 @@ def main():
 
     server_host = input("Rendezvous server hostname: ").strip()
     server_ip = socket.gethostbyname(server_host)
-    server_port = 5000  # Matches rendezvous.py PORT
+    server_port = 8888 # Matches rendezvous.py PORT
 
     # Pick a local port and reuse it for BOTH the rendezvous connection
     # and the P2P connection — this is critical for hole punching.

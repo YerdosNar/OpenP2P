@@ -6,7 +6,7 @@ import json
 from logger import info, warn, error
 
 HOST = "0.0.0.0"
-PORT = 5000
+PORT = 8888
 
 rooms = {}
 rooms_lock = threading.Lock()
