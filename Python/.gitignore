@@ -1,6 +1,0 @@
-venv/*
-venv/
-test/*
-test/
-__pycache__/*
-__pycache__/

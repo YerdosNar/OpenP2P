@@ -8,7 +8,7 @@ from common.socket_utils import create_reusable_udp_socket
 
 async def smoke():
     # 1. TCP connect + HELLO exchange
-    reader, writer = await asyncio.open_connection("127.0.0.1", 9999)
+    reader, writer = await asyncio.open_connection("103.115.18.208", 8888)
     priv, pub = crypto.generate_keypair()
     writer.write(frame(encode(MsgType.HELLO, crypto.serialize_public_key(pub))))
     await writer.drain()
@@ -32,7 +32,7 @@ async def smoke():
     udp_sock = create_reusable_udp_socket()
     local_udp_port = udp_sock.getsockname()[1]
     print(f"Sending probe from local UDP port {local_udp_port}")
-    udp_sock.sendto(nonce, ("127.0.0.1", 9999))
+    udp_sock.sendto(nonce, ("103.115.18.208", 8888))
 
     # 4. Expect OBSERVED_ADDR on the TCP channel
     ct = await read_frame(reader)

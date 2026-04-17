@@ -31,7 +31,7 @@ ROLE_PROMPT = "Are you [H]ost or [J]oin [h/j]: "
 
 
 class RendezvousServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 9999):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8888):
         self._host = host
         self._port = port
         self._registry = RoomRegistry()

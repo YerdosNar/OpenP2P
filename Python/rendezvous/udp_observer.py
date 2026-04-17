@@ -40,6 +40,7 @@ class UDPObserver(asyncio.DatagramProtocol):
 
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
+        log.info("UDP datagram from %s, %d bytes", addr, len(data))
         # accept only exact-sized probes; anything else is noise
         if len(data) != NONCE_SIZE:
             return
