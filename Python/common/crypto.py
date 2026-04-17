@@ -23,7 +23,7 @@ def serialize_public_key(public_key: X25519PublicKey) -> bytes:
     )
 
 
-def deseralize_public_key(data: bytes) -> X25519PublicKey:
+def deserialize_public_key(data: bytes) -> X25519PublicKey:
     if len(data) != 32:
         raise ValueError(f"Expected 32 bytes for X25519PublicKey, got {len(data)}")
     return X25519PublicKey.from_public_bytes(data)

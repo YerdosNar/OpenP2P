@@ -17,25 +17,28 @@ from enum import IntEnum
 
 class MsgType(IntEnum):
     # handshake
-    HELLO       = 0x01
+    HELLO           = 0x01
 
     # rendezvous <-> peer
-    ROLE_SELECT = 0x10
-    ROOM_CREATE = 0x11
-    ROOM_JOIN   = 0x12
-    ROOM_RESULT = 0x13
-    PEER_INFO   = 0x14
-    ERROR       = 0x15
-    KEEPALIVE   = 0x16
+    ROLE_SELECT     = 0x10
+    ROOM_CREATE     = 0x11
+    ROOM_JOIN       = 0x12
+    ROOM_RESULT     = 0x13
+    PEER_INFO       = 0x14
+    ERROR           = 0x15
+    KEEPALIVE       = 0x16
+    # UDP port observ
+    OBSERVE_REQUEST = 0x17
+    OBSERVED_ADDR   = 0x18
 
     # p <-> p
-    CHAT        = 0x20
-    FILE_OFFER  = 0x21
-    FILE_ACCEPT = 0x22
-    FILE_REJECT = 0x23
-    FILE_CHUNK  = 0x24
-    FILE_DONE   = 0x25
-    BYE         = 0x2F
+    CHAT            = 0x20
+    FILE_OFFER      = 0x21
+    FILE_ACCEPT     = 0x22
+    FILE_REJECT     = 0x23
+    FILE_CHUNK      = 0x24
+    FILE_DONE       = 0x25
+    BYE             = 0x2F
 
 
 LENGTH_PREFIX   = struct.Struct("!I")   # 4-byte big-endian unsigned int
@@ -51,17 +54,17 @@ def frame(payload: bytes) -> bytes:
 async def read_frame(reader) -> bytes:
     """
     Read one framed message from an asyncio StreamReader (or similar object)
-    exposing `readerexactly`). Returns the payload bytes (length prefix stripper).
+    exposing `readexactly`). Returns the payload bytes (length prefix stripper).
 
     Raises ValueError if the announced length exceeds MAX_FRAME_SIZE -
     a basic safeguard against a malicious or confused peer claiming
     gigabyte-sized frames.
     """
-    header = await reader.readerexactly(LENGTH_PREFIX.size)
+    header = await reader.readexactly(LENGTH_PREFIX.size)
     (length,) = LENGTH_PREFIX.unpack(header)
     if length > MAX_FRAME_SIZE:
         raise ValueError(f"Frame announces {length} bytes, exceeds cap")
-    return await reader.readerexactly(length)
+    return await reader.readexactly(length)
 
 
 # Payload Encoding/Decoding START
