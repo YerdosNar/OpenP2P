@@ -37,6 +37,7 @@ class PeerHandoff:
     peer_pubkey: bytes
     our_priv: object
     our_pub: object
+    is_host: bool
 
 
 # Tunables
@@ -129,7 +130,8 @@ class PeerClient:
                 peer_port=peer_info["port"],
                 peer_pubkey=peer_info["pubkey"],
                 our_priv=p2p_priv,
-                our_pub=p2p_pub
+                our_pub=p2p_pub,
+                is_host=(role == "h"),
             )
 
         finally:
@@ -326,7 +328,40 @@ async def _main(rendezvous_host: str, rendezvous_port: int):
     print(f"    Peer endpoint:          {handoff.peer_ip}:{handoff.peer_port}")
     print(f"    Peer public key:        {handoff.peer_pubkey.hex()[:32]}...")
     print("\n(Needed to open a QUIC connection to the peer)")
-    handoff.udp_socket.close()
+
+    from peer.p2p import punch_hole, QuicPeer
+
+    peer_addr = (handoff.peer_ip, handoff.peer_port)
+
+    # Phase 1: simultaneous hole punching.
+    await punch_hole(handoff.udp_socket, peer_addr, is_host=handoff.is_host)
+
+    # Phase 2: QUIC handshake.
+    quic_peer = QuicPeer(handoff.udp_socket, peer_addr, is_host=handoff.is_host)
+    run_task = asyncio.create_task(quic_peer.run())
+
+    ok = await quic_peer.wait_handshake(timeout=10.0)
+    if not ok:
+        print("QUIC handshake timed out.")
+        run_task.cancel()
+        return
+
+    print("QUIC connection established!")
+
+    # Minimal hello-world: open a stream, exchange one message each way.
+    stream_id = quic_peer.get_next_stream_id()
+    greeting = f"Hello from {'host' if handoff.is_host else 'joiner'}!".encode()
+
+    async def on_data(sid, data, end):
+        print(f"Received on stream {sid}: {data.decode(errors='replace')!r}")
+
+    quic_peer.on_stream_data = on_data
+    quic_peer.send_stream(stream_id, greeting, end_stream=False)
+
+    # Let the connection live for a few seconds to exchange messages.
+    await asyncio.sleep(5)
+    await quic_peer.close()
+    run_task.cancel()
 
 
 def main():
