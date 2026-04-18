@@ -1,8 +1,8 @@
 """
-Encrypted, framed, typed message channel built on asyncio streams.
+An encrypted, framed, typed message channel built on asyncio streams.
 
-AFter ECDH handshake, both sides wrap their (reader, writer) pair in an
-EncryptedChannel and use `send_msg/recv_msg` as their only I/O primitive
+After ECDH handshake, both sides wrap their (reader, writer) pair in an
+EncryptedChannel and use send_msg / recv_msg as their only I/O primitive.
 """
 
 import asyncio
@@ -17,9 +17,8 @@ class EncryptedChannel:
     Thin wrapper that encrypts outgoing payloads and decrypts incoming ones.
 
     The underlying transport is asyncio streams (TCP). The frame-length prefix
-    stays in the clear; the [type||body] portion is what gets encrypted
+    stays in the clear; the [type||body] portion is what gets encrypted.
     """
-
 
     def __init__(
         self,
@@ -31,23 +30,16 @@ class EncryptedChannel:
         self._writer = writer
         self._key = shared_key
 
-
-    async def send_msg(
-        self,
-        msg_type: MsgType,
-        body: bytes = b""
-    ) -> None:
+    async def send_msg(self, msg_type: MsgType, body: bytes = b"") -> None:
         payload = encode(msg_type, body)
         ciphertext = crypto.encrypt(self._key, payload)
         self._writer.write(frame(ciphertext))
         await self._writer.drain()
 
-
     async def recv_msg(self) -> tuple[MsgType, bytes]:
         ciphertext = await read_frame(self._reader)
         payload = crypto.decrypt(self._key, ciphertext)
         return decode(payload)
-
 
     async def close(self) -> None:
         self._writer.close()
@@ -55,7 +47,6 @@ class EncryptedChannel:
             await self._writer.wait_closed()
         except Exception:
             pass
-
 
     @property
     def peer_address(self) -> tuple[str, int]:

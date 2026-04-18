@@ -1,2 +1,4 @@
 ren_test.py
 __pycache__
+rendezvous/__pycache__*
+peer/__pycache__*

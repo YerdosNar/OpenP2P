@@ -1,10 +1,10 @@
 """
 In-memory state for the Rendezvous server.
 
-A `Room` reporesents a host waiting for a joiner. The `RoomRegistry` owns
+A `Room` represents a host waiting for a joiner. The `RoomRegistry` owns
 all active rooms, enforces unique IDs, and handles the 3-minute timeout.
 
-All operations assume a single asyncio event loop - no external locking
+All operations assume a single asyncio event loop — no external locking.
 """
 
 import asyncio
@@ -13,34 +13,38 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+# From your spec: "After P1 stays in the server for 3 minutes (180 seconds)."
 ROOM_TTL_SECONDS = 180.0
 
 
 @dataclass
 class Room:
+    """One waiting host's room."""
     room_id: str
     room_pw: str
-    host_pubkey: bytes
-    host_ip: str
-    host_port: int
-    created_at: float
+    host_pubkey: bytes           # 32-byte X25519 public key for P2P
+    host_ip: str                 # External IP as observed by Rendezvous
+    host_port: int               # External port as observed by Rendezvous
+    created_at: float            # time.monotonic() timestamp
 
+    # When the joiner arrives, we need to notify the host. We do that by
+    # storing an asyncio.Future here. The host's session awaits this future;
+    # the join path sets its result.
     joiner_arrived: asyncio.Future = field(default_factory=asyncio.Future)
 
+    # The timeout task that will delete this room after ROOM_TTL_SECONDS.
+    # Stored so we can cancel it on successful join or early host disconnect.
     _timeout_task: Optional[asyncio.Task] = None
 
-
     def is_expired(self, now: Optional[float] = None) -> bool:
-        """True if the 3-minute TTL has elapsed"""
+        """True if the 3-minute TTL has elapsed."""
         now = now if now is not None else time.monotonic()
         return (now - self.created_at) >= ROOM_TTL_SECONDS
 
-
     def seconds_remaining(self, now: Optional[float] = None) -> float:
-        """How long this room has left before expiring"""
+        """How long this room has left before expiring. Clamped at 0."""
         now = now if now is not None else time.monotonic()
         return max(0.0, ROOM_TTL_SECONDS - (now - self.created_at))
-
 
     def check_password(self, candidate: str) -> bool:
         """Constant-time password comparison."""
@@ -49,7 +53,7 @@ class Room:
 
 @dataclass
 class JoinResult:
-    """What the registry returns to a successful joiner"""
+    """What the registry returns to a successful joiner."""
     host_pubkey: bytes
     host_ip: str
     host_port: int
@@ -59,14 +63,14 @@ class RoomRegistry:
     """
     Tracks all active rooms, keyed by room_id.
 
-    Single-event-loop ownership - no share across threads without
+    Single-event-loop ownership — do not share across threads without
     adding locks.
     """
-
 
     def __init__(self):
         self._rooms: dict[str, Room] = {}
 
+    # -------- Host side --------
 
     def create_room(
         self,
@@ -77,7 +81,7 @@ class RoomRegistry:
         host_port: int,
     ) -> Room:
         """
-        Register a new room. Raises KeyError if `room_id` is taken.
+        Register a new room. Raises KeyError if room_id is already taken.
 
         The caller (server code) is responsible for scheduling the timeout
         via schedule_timeout() after awaiting on the host side.
@@ -86,7 +90,7 @@ class RoomRegistry:
             raise KeyError(f"Room {room_id!r} already exists")
 
         if len(host_pubkey) != 32:
-            raise ValueError("host_pubkey must be 32 bytes(X25519)")
+            raise ValueError("host_pubkey must be 32 bytes (X25519)")
 
         room = Room(
             room_id=room_id,
@@ -94,11 +98,10 @@ class RoomRegistry:
             host_pubkey=host_pubkey,
             host_ip=host_ip,
             host_port=host_port,
-            created_at=time.monotonic()
+            created_at=time.monotonic(),
         )
         self._rooms[room_id] = room
         return room
-
 
     def schedule_timeout(self, room: Room) -> None:
         """
@@ -109,23 +112,22 @@ class RoomRegistry:
             try:
                 await asyncio.sleep(ROOM_TTL_SECONDS)
             except asyncio.CancelledError:
-                return # Room was deleted early; nothing to do
-            # If here, dlete and notify the host (if waiting)
+                return  # Room was deleted early; nothing to do.
+            # Still here? Delete and notify the host (if still waiting).
             self._expire_room(room.room_id)
 
         room._timeout_task = asyncio.create_task(_expire())
-
 
     def _expire_room(self, room_id: str) -> None:
         """Internal: remove a room because it timed out."""
         room = self._rooms.pop(room_id, None)
         if room is None:
-            return # Already gone
+            return  # Already gone (joiner matched first); no-op.
         if not room.joiner_arrived.done():
+            # Signal the waiting host that no joiner came.
             room.joiner_arrived.set_exception(
                 TimeoutError(f"Room {room_id!r} expired without a joiner")
             )
-
 
     def remove_host(self, room_id: str) -> None:
         """
@@ -140,6 +142,7 @@ class RoomRegistry:
         if not room.joiner_arrived.done():
             room.joiner_arrived.cancel()
 
+    # -------- Joiner side --------
 
     def try_join(
         self,
@@ -150,12 +153,12 @@ class RoomRegistry:
         joiner_port: int,
     ) -> Optional[JoinResult]:
         """
-        Attempt to join
+        Attempt to match a joiner with a host.
 
-        SUCCESS: removes the room, cancels its timeout, resolves the host's
-        future with the joiner's info, and returns a JoinResult for the joiner
+        On success: removes the room, cancels its timeout, resolves the host's
+        future with the joiner's info, and returns a JoinResult for the joiner.
 
-        FAIL (no such room, wrong password): returns None. The caller
+        On failure (no such room, wrong password): returns None. The caller
         is responsible for kicking the joiner.
         """
         room = self._rooms.get(room_id)
@@ -164,16 +167,16 @@ class RoomRegistry:
         if not room.check_password(candidate_pw):
             return None
         if len(joiner_pubkey) != 32:
-            return None
+            return None  # Malformed; treat as failure.
 
-        # Remove from registry FIRST so noone else can match
+        # Remove from registry FIRST so no second joiner can match.
         del self._rooms[room_id]
 
-        # cancel the expiry time; it's no longer needed
+        # Cancel the expiry timer; it's no longer relevant.
         if room._timeout_task is not None and not room._timeout_task.done():
             room._timeout_task.cancel()
 
-        # Wake the host with the joiner's details
+        # Wake the host with the joiner's details.
         if not room.joiner_arrived.done():
             room.joiner_arrived.set_result({
                 "pubkey": joiner_pubkey,
@@ -187,8 +190,8 @@ class RoomRegistry:
             host_port=room.host_port,
         )
 
+    # -------- Introspection (useful for tests and logging) --------
 
-    # introspection
     def __len__(self) -> int:
         return len(self._rooms)
 

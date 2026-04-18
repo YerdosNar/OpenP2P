@@ -31,7 +31,7 @@ ROLE_PROMPT = "Are you [H]ost or [J]oin [h/j]: "
 
 
 class RendezvousServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 8888):
+    def __init__(self, host: str = "0.0.0.0", port: int = 9999):
         self._host = host
         self._port = port
         self._registry = RoomRegistry()
@@ -39,10 +39,8 @@ class RendezvousServer:
         self._udp_observer: Optional[UDPObserver] = None
         self._udp_transport: Optional[asyncio.DatagramTransport] = None
 
-    # -------- Entry points --------
-
     async def serve_forever(self) -> None:
-        # start UDP observer first so it's ready when first peer arrives
+        # Start UDP observer first so it's ready when the first peer arrives.
         self._udp_observer, self._udp_transport = await start_udp_observer(
             self._host, self._port
         )
@@ -51,7 +49,7 @@ class RendezvousServer:
             self._handle_connection, self._host, self._port
         )
         for s in (self._server.sockets or []):
-            log.info("Rendezvous listening on %s", s.getsockname())
+            log.info("Rendezvous TCP listening on %s", s.getsockname())
 
         try:
             async with self._server:
@@ -61,12 +59,15 @@ class RendezvousServer:
                 self._udp_transport.close()
 
 
+    # -------- UDP endpoint observation --------
+
     OBSERVE_TIMEOUT_SECONDS = 3.0
+
     async def _observe_peer_udp(
         self, channel: EncryptedChannel, peername: tuple
     ) -> Optional[tuple[str, int]]:
         """
-        Ask the peer to send a UDP prove so we can observe their NAT-translated
+        Ask the peer to send a UDP probe so we can observe their NAT-translated
         UDP endpoint. Returns (ip, port) or None on failure (peer already sent
         ERROR to itself via the outer handler if needed).
         """
@@ -75,30 +76,31 @@ class RendezvousServer:
         nonce = os.urandom(NONCE_SIZE)
         future = self._udp_observer.register_nonce(nonce)
 
-        # Tell peer oto UDP with this nonce
+        # Tell the peer: send a UDP probe containing this nonce.
         await channel.send_msg(MsgType.OBSERVE_REQUEST, nonce)
+
         try:
-            ip, port = await asyncio.wait_for(
-                future, self.OBSERVE_TIMEOUT_SECONDS)
+            ip, port = await asyncio.wait_for(future, self.OBSERVE_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             self._udp_observer.cancel_nonce(nonce)
             log.warning("%s: UDP probe did not arrive within %.1fs",
                         peername, self.OBSERVE_TIMEOUT_SECONDS)
             await channel.send_msg(
                 MsgType.ERROR,
-                json.dumps({"reason": "UDP observation failed; cannot hole punch"}).encode("utf-8")
+                json.dumps({"reason": "UDP observation failed; cannot hole punch"})
+                    .encode("utf-8"),
             )
             return None
 
         log.info("%s: observed UDP endpoint %s:%d", peername, ip, port)
 
-        # inform about external ip:port
+        # Inform the peer of what we saw. Not strictly required for the
+        # protocol to work, but useful for the peer's logs and diagnostics.
         await channel.send_msg(
             MsgType.OBSERVED_ADDR,
-            json.dumps({"ip": ip, "port": port}).encode("utf-8")
+            json.dumps({"ip": ip, "port": port}).encode("utf-8"),
         )
         return (ip, port)
-
 
     # -------- Per-connection handler --------
 
@@ -151,11 +153,9 @@ class RendezvousServer:
 
             role = body.decode("utf-8").strip().lower()
             if role == "h":
-                await self._handle_host_session(
-                    channel, peername, observed_ip, observed_port)
+                await self._handle_host_session(channel, peername, observed_ip, observed_port)
             elif role == "j":
-                await self._handle_joiner_session(
-                    channel, peername, observed_ip, observed_port)
+                await self._handle_joiner_session(channel, peername, observed_ip, observed_port)
             else:
                 await channel.send_msg(
                     MsgType.ERROR,
@@ -283,7 +283,6 @@ class RendezvousServer:
                 json.dumps({"reason": f"malformed ROOM_JOIN: {e}"}).encode("utf-8"),
             )
             return
-
 
         result = self._registry.try_join(
             room_id=room_id,
