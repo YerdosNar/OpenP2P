@@ -1,10 +1,8 @@
 import asyncio
 import hashlib
 import hmac
-import json
 import logging
 import os
-import struct
 import time
 from pathlib import Path
 from typing import Optional
@@ -63,25 +61,136 @@ class Session:
         self._our_priv = our_priv
         self._peer_pubkey_bytes = peer_pubkey_bytes
         self._is_host = is_host
+
         self._streams = {}
-        self._auth_stream_id = None
-        self._chat_stream_id = None
+        self._stream_ready = asyncio.Event()
+
+        self._auth_stream_id: Optional[int] = None
+        self._chat_stream_id: Optional[int] = None
+        self._post_auth = False
+
         self._pending_incoming_files = {}
         self._auth_key: Optional[bytes] = None
         self._authenticated = asyncio.Event()
         self._stop = asyncio.Event()
         self._ingress_tasks = []
 
-    async def _on_stream_data(self, stream_id: int, data: bytes, end_stream: bool):
+        self._quic.on_stream_data = self._on_stream_data
+
+    def _get_or_create_stream(self, stream_id: int) -> StreamReader:
         reader = self._streams.get(stream_id)
         if reader is None:
             reader = StreamReader()
             self._streams[stream_id] = reader
-            task = asyncio.create_task(self._handle_incoming_stream(stream_id, reader))
-            self._ingress_tasks.append(task)
+            self._stream_ready.set()
+        return reader
+
+    async def _on_stream_data(self, stream_id: int, data: bytes, end_stream: bool):
+        is_new = stream_id not in self._streams
+        reader = self._get_or_create_stream(stream_id)
         reader.feed(data, end_stream)
 
-    async def _handle_incoming_stream(self, stream_id: int, reader: StreamReader):
+        if is_new and self._post_auth and stream_id != self._auth_stream_id:
+            task = asyncio.create_task(self._handle_app_stream(stream_id, reader))
+            self._ingress_tasks.append(task)
+
+    async def _wait_for_any_stream(self, timeout: float) -> Optional[int]:
+        if self._streams:
+            return next(iter(self._streams))
+        try:
+            await asyncio.wait_for(self._stream_ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        self._stream_ready.clear()
+        if self._streams:
+            return next(iter(self._streams))
+        return None
+
+    async def authenticate(self) -> bool:
+        peer_pub_obj = X25519PublicKey.from_public_bytes(self._peer_pubkey_bytes)
+        self._auth_key = crypto.derive_shared_key(
+            self._our_priv, peer_pub_obj, info=b"p2p-auth v1"
+        )
+
+        our_challenge = os.urandom(AUTH_CHALLENGE_SIZE)
+
+        if self._is_host:
+            sid = await self._wait_for_any_stream(AUTH_TIMEOUT)
+            if sid is None:
+                log.error("auth: joiner never opened auth stream")
+                return False
+            self._auth_stream_id = sid
+            reader = self._streams[sid]
+
+            try:
+                peer_challenge = await asyncio.wait_for(
+                    reader.read_exactly(AUTH_CHALLENGE_SIZE), AUTH_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.error("auth: no peer challenge received")
+                return False
+
+            self._quic.send_stream(sid, our_challenge, end_stream=False)
+            our_response = hmac.new(
+                self._auth_key, peer_challenge, hashlib.sha256
+            ).digest()
+            self._quic.send_stream(sid, our_response, end_stream=False)
+
+            try:
+                peer_response = await asyncio.wait_for(
+                    reader.read_exactly(32), AUTH_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.error("auth: no peer response received")
+                return False
+
+            expected = hmac.new(
+                self._auth_key, our_challenge, hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(expected, peer_response):
+                log.error("auth: peer response INVALID")
+                return False
+
+            self._post_auth = True
+            self._authenticated.set()
+            log.info("auth: succeeded (host side)")
+            return True
+        else:
+            sid = self._quic.get_next_stream_id()
+            self._auth_stream_id = sid
+            reader = self._get_or_create_stream(sid)
+
+            self._quic.send_stream(sid, our_challenge, end_stream=False)
+
+            try:
+                peer_challenge = await asyncio.wait_for(
+                    reader.read_exactly(AUTH_CHALLENGE_SIZE), AUTH_TIMEOUT
+                )
+                peer_response = await asyncio.wait_for(
+                    reader.read_exactly(32), AUTH_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                log.error("auth: joiner timed out waiting for host")
+                return False
+
+            expected = hmac.new(
+                self._auth_key, our_challenge, hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(expected, peer_response):
+                log.error("auth: host response INVALID")
+                return False
+
+            our_response = hmac.new(
+                self._auth_key, peer_challenge, hashlib.sha256
+            ).digest()
+            self._quic.send_stream(sid, our_response, end_stream=False)
+
+            self._post_auth = True
+            self._authenticated.set()
+            log.info("auth: succeeded (joiner side)")
+            return True
+
+    async def _handle_app_stream(self, stream_id: int, reader: StreamReader):
         try:
             first = await reader.read_frame()
         except (EOFError, asyncio.CancelledError):
@@ -100,119 +209,11 @@ class Session:
             await self._chat_ingress_loop(stream_id, reader, initial_body=body)
         elif mt == MsgType.FILE_OFFER:
             await self._file_ingress_loop(stream_id, reader, initial_body=body)
+        elif mt == MsgType.BYE:
+            print("\n[peer said BYE; closing]")
+            self._stop.set()
         else:
             log.warning("stream %d: unexpected first message type %s", stream_id, mt)
-
-    async def authenticate(self) -> bool:
-        peer_pub_obj = X25519PublicKey.from_public_bytes(self._peer_pubkey_bytes)
-        self._auth_key = crypto.derive_shared_key(
-            self._our_priv, peer_pub_obj, info=b"p2p-auth v1"
-        )
-
-        self._quic.on_stream_data = self._on_stream_data
-
-        our_challenge = os.urandom(AUTH_CHALLENGE_SIZE)
-
-        if self._is_host:
-            auth_reader = StreamReader()
-            auth_fut = asyncio.get_running_loop().create_future()
-
-            original_on_data = self._quic.on_stream_data
-
-            async def auth_sniffer(sid, data, end):
-                if self._auth_stream_id is None:
-                    self._auth_stream_id = sid
-                    self._streams[sid] = auth_reader
-                    if not auth_fut.done():
-                        auth_fut.set_result(sid)
-                if sid == self._auth_stream_id:
-                    auth_reader.feed(data, end)
-                else:
-                    await original_on_data(sid, data, end)
-
-            self._quic.on_stream_data = auth_sniffer
-
-            try:
-                await asyncio.wait_for(auth_fut, AUTH_TIMEOUT)
-            except asyncio.TimeoutError:
-                log.error("auth: peer did not open auth stream")
-                self._quic.on_stream_data = original_on_data
-                return False
-
-            try:
-                peer_challenge = await asyncio.wait_for(
-                    auth_reader.read_exactly(AUTH_CHALLENGE_SIZE), AUTH_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                log.error("auth: no peer challenge received")
-                self._quic.on_stream_data = original_on_data
-                return False
-
-            self._quic.send_stream(self._auth_stream_id, our_challenge, end_stream=False)
-
-            our_response = hmac.new(
-                self._auth_key, peer_challenge, hashlib.sha256
-            ).digest()
-            self._quic.send_stream(self._auth_stream_id, our_response, end_stream=False)
-
-            try:
-                peer_response = await asyncio.wait_for(
-                    auth_reader.read_exactly(32), AUTH_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                log.error("auth: no peer response received")
-                self._quic.on_stream_data = original_on_data
-                return False
-
-            expected = hmac.new(
-                self._auth_key, our_challenge, hashlib.sha256
-            ).digest()
-            if not hmac.compare_digest(expected, peer_response):
-                log.error("auth: peer response INVALID")
-                self._quic.on_stream_data = original_on_data
-                return False
-
-            self._quic.on_stream_data = self._on_stream_data
-            self._authenticated.set()
-            log.info("auth: succeeded (host side)")
-            return True
-        else:
-            self._auth_stream_id = self._quic.get_next_stream_id()
-            auth_reader = StreamReader()
-            self._streams[self._auth_stream_id] = auth_reader
-
-            self._quic.send_stream(
-                self._auth_stream_id, our_challenge, end_stream=False
-            )
-
-            try:
-                peer_challenge = await asyncio.wait_for(
-                    auth_reader.read_exactly(AUTH_CHALLENGE_SIZE), AUTH_TIMEOUT
-                )
-                peer_response = await asyncio.wait_for(
-                    auth_reader.read_exactly(32), AUTH_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                log.error("auth: joiner timed out waiting for host")
-                return False
-
-            expected = hmac.new(
-                self._auth_key, our_challenge, hashlib.sha256
-            ).digest()
-            if not hmac.compare_digest(expected, peer_response):
-                log.error("auth: host response INVALID")
-                return False
-
-            our_response = hmac.new(
-                self._auth_key, peer_challenge, hashlib.sha256
-            ).digest()
-            self._quic.send_stream(
-                self._auth_stream_id, our_response, end_stream=False
-            )
-
-            self._authenticated.set()
-            log.info("auth: succeeded (joiner side)")
-            return True
 
     def _ensure_chat_stream(self) -> int:
         if self._chat_stream_id is None:
@@ -279,6 +280,7 @@ class Session:
         file_hash = h.hexdigest()
 
         sid = self._quic.get_next_stream_id()
+        reader = self._get_or_create_stream(sid)
 
         offer = encode_json(MsgType.FILE_OFFER, {
             "name": name,
@@ -286,9 +288,6 @@ class Session:
             "sha256": file_hash,
         })
         self._quic.send_stream(sid, frame(offer), end_stream=False)
-
-        reader = StreamReader()
-        self._streams[sid] = reader
 
         print(f"[sent FILE_OFFER for {name} ({size} bytes)]")
 
@@ -401,7 +400,6 @@ class Session:
                         print(f"\n[receiving {name}: {received}/{size} bytes ({pct:.1f}%)]\n> ",
                               end="", flush=True)
                 elif mt == MsgType.FILE_DONE:
-                    done_obj = decode_json(body)
                     got_hash = h.hexdigest()
                     if expected_hash and got_hash != expected_hash:
                         print(f"\n[WARNING: hash mismatch for {name}! got {got_hash[:16]}..]")
