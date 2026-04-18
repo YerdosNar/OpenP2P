@@ -1,8 +1,5 @@
 """
 Peer-to-peer transport: UDP hole punching and QUIC connection management.
-
-Takes a hole-punched UDP socket and peer info, produces a live QUIC
-connection between two peers.
 """
 
 import asyncio
@@ -21,6 +18,7 @@ from aioquic.quic.events import (
     StreamDataReceived,
     ConnectionTerminated,
 )
+from aioquic.quic.packet import pull_quic_header
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -38,7 +36,6 @@ QUIC_ALPN = ["p2p-chat/1"]
 # -------- Self-signed cert generation --------
 
 def generate_selfsigned_cert() -> tuple[bytes, bytes]:
-    """Generate an ephemeral self-signed cert for QUIC/TLS."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "p2p-peer"),
@@ -70,7 +67,6 @@ async def punch_hole(
     peer_addr: tuple[str, int],
     is_host: bool,
 ) -> None:
-    """Spam tiny UDP packets at peer_addr to open the NAT hole."""
     loop = asyncio.get_running_loop()
     role = "host" if is_host else "joiner"
     log.info("[%s] Hole punching %s:%d", role, peer_addr[0], peer_addr[1])
@@ -107,9 +103,8 @@ class QuicPeer:
         )
         self._closed = False
         self._wake = asyncio.Event()
-        # Callbacks set by higher layers
-        self.on_stream_data = None  # async callable(stream_id, data, end_stream)
-        self.on_terminated = None   # async callable(reason)
+        self.on_stream_data = None
+        self.on_terminated = None
 
     def _build_configuration(self) -> QuicConfiguration:
         config = QuicConfiguration(
@@ -140,14 +135,18 @@ class QuicPeer:
                  self._sock.fileno(), self._sock.getsockname())
 
         config = self._build_configuration()
-        self._quic = QuicConnection(configuration=config)
 
         if not self._is_host:
+            # Client: can construct QUIC immediately and send Initial.
+            self._quic = QuicConnection(configuration=config)
             log.info("[%s] calling QUIC connect()", role)
             self._quic.connect(self._peer_addr, now=self._now())
-            # CRITICAL: flush the Initial packet immediately, don't wait
-            # for a timer. Without this, the handshake can stall.
             await self._flush_out()
+        else:
+            # Host: must wait for the first Initial packet from the client,
+            # parse its Destination Connection ID, and build QuicConnection
+            # with that ID. Happens inside _recv_loop on first packet.
+            log.info("[%s] waiting for first client Initial...", role)
 
         recv_task = asyncio.create_task(self._recv_loop())
         timer_task = asyncio.create_task(self._timer_loop())
@@ -187,6 +186,24 @@ class QuicPeer:
             if len(data) == 0:
                 continue
 
+            # Host lazy-init: parse the Destination CID from the first
+            # real packet and construct QuicConnection now.
+            if self._is_host and self._quic is None:
+                try:
+                    buf = _Buffer(data)
+                    header = pull_quic_header(buf, host_cid_length=8)
+                except Exception as e:
+                    log.warning("[%s] cannot parse first packet header: %s",
+                                role, e)
+                    continue
+                log.info("[%s] first Initial received; DCID=%s",
+                         role, header.destination_cid.hex())
+                config = self._build_configuration()
+                self._quic = QuicConnection(
+                    configuration=config,
+                    original_destination_connection_id=header.destination_cid,
+                )
+
             self._quic.receive_datagram(data, addr, now=self._now())
             await self._process_quic_events()
             await self._flush_out()
@@ -194,11 +211,18 @@ class QuicPeer:
     async def _timer_loop(self) -> None:
         role = "host" if self._is_host else "joiner"
         while not self._closed:
-            assert self._quic is not None
+            if self._quic is None:
+                # Host hasn't received first packet yet; just wait.
+                try:
+                    await asyncio.wait_for(self._wake.wait(), 0.5)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
+                continue
+
             timer_at = self._quic.get_timer()
             now = self._now()
             if timer_at is None:
-                # No timer active; wait briefly and poll again
                 try:
                     await asyncio.wait_for(self._wake.wait(), 0.1)
                 except asyncio.TimeoutError:
@@ -220,7 +244,8 @@ class QuicPeer:
     async def _flush_out(self) -> None:
         loop = asyncio.get_running_loop()
         role = "host" if self._is_host else "joiner"
-        assert self._quic is not None
+        if self._quic is None:
+            return
         count = 0
         total_bytes = 0
         for data, addr in self._quic.datagrams_to_send(now=self._now()):
@@ -237,7 +262,8 @@ class QuicPeer:
 
     async def _process_quic_events(self) -> None:
         role = "host" if self._is_host else "joiner"
-        assert self._quic is not None
+        if self._quic is None:
+            return
         while True:
             event = self._quic.next_event()
             if event is None:
@@ -287,3 +313,7 @@ class QuicPeer:
             await self._flush_out()
         self._closed = True
         self._wake.set()
+
+
+# Small helper: aioquic's pull_quic_header expects a Buffer object.
+from aioquic.buffer import Buffer as _Buffer  # noqa: E402  (imported late for clarity)
