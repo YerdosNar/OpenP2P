@@ -1,3 +1,12 @@
+"""Interactive peer client:
+
+  1. TCP-connect to the rendezvous server, do HELLO + X25519 handshake.
+  2. Rendezvous observes our public UDP endpoint via a nonce probe.
+  3. User picks host/joiner, gives room ID + password.
+  4. Rendezvous exchanges (ip, port, pubkey) between the two peers.
+  5. UDP hole-punch toward peer.
+  6. QUIC handshake over the punched socket (host = QUIC server).
+  7. Session: mutual HMAC auth, then chat + file transfer."""
 import asyncio
 import json
 import logging
@@ -42,6 +51,7 @@ class PeerClient:
         self._rz_port = rendezvous_port
 
     async def run(self) -> Optional[PeerHandoff]:
+        # Keypair used for end-to-end identity with the *peer*.
         p2p_priv, p2p_pub = crypto.generate_keypair()
 
         udp_sock = create_reusable_udp_socket()
@@ -72,6 +82,8 @@ class PeerClient:
             log.info("Rendezvous observed us at %s:%d",
                      observed_ip, observed_port)
 
+            # Keep the NAT mapping alive toward the rendezvous while we're
+            # deciding on role / waiting for a peer.
             keepalive_task = asyncio.create_task(
                 nat_keepalive_loop(udp_sock, (self._rz_host, self._rz_port))
             )
@@ -314,6 +326,16 @@ async def _main(rendezvous_host: str, rendezvous_port: int):
     quic_peer = QuicPeer(
         handoff.udp_socket, peer_addr, is_host=handoff.is_host
     )
+    # IMPORTANT: construct Session *before* waiting for handshake so the
+    # on_stream_data callback is wired up immediately. QuicPeer also buffers
+    # any pre-registration stream data as a belt-and-braces measure.
+    session = Session(
+        quic_peer,
+        handoff.our_priv,
+        handoff.peer_pubkey,
+        is_host=handoff.is_host,
+    )
+
     run_task = asyncio.create_task(quic_peer.run())
 
     print("Waiting for QUIC handshake (up to 15s)...")
@@ -330,13 +352,6 @@ async def _main(rendezvous_host: str, rendezvous_port: int):
         return
 
     print("\n*** QUIC connection established! ***\n")
-
-    session = Session(
-        quic_peer,
-        handoff.our_priv,
-        handoff.peer_pubkey,
-        is_host=handoff.is_host,
-    )
 
     print("Authenticating peer...")
     auth_ok = await session.authenticate()
@@ -375,7 +390,7 @@ def main():
     parser.add_argument("--host", required=True,
                         help="Rendezvous server host")
     parser.add_argument("--port", type=int, default=8888,
-                        help="Rendezvous server port")
+                        help="Rendezvous server port (default 8888)")
     args = parser.parse_args()
     try:
         asyncio.run(_main(args.host, args.port))

@@ -1,3 +1,4 @@
+"""Authenticated-encrypted framing on top of asyncio TCP streams."""
 import asyncio
 from common import crypto
 from common.protocol import (

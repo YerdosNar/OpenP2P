@@ -1,3 +1,4 @@
+"""UDP socket helpers shared between rendezvous + peer."""
 import asyncio
 import socket
 import sys

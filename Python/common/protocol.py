@@ -1,3 +1,4 @@
+"""Wire protocol: message types, length-prefixed frames, chunk helpers."""
 import json
 import struct
 from enum import IntEnum
@@ -26,6 +27,8 @@ class MsgType(IntEnum):
 
 
 LENGTH_PREFIX = struct.Struct("!I")
+# Per-frame cap (protects chat & control messages from DoS).
+# File chunks are 64 KB, well under this.
 MAX_FRAME_SIZE = 16 * 1024 * 1024
 
 
@@ -47,7 +50,7 @@ def encode(msg_type: MsgType, body: bytes = b"") -> bytes:
     return bytes([msg_type]) + body
 
 
-def decode(payload: bytes) -> tuple:
+def decode(payload: bytes):
     if len(payload) < 1:
         raise ValueError("Empty payload")
     try:
@@ -66,14 +69,17 @@ def decode_json(body: bytes):
     return json.loads(body.decode("utf-8"))
 
 
-CHUNK_HEADER = struct.Struct("!I")
+# File-chunk header: 64-bit unsigned sequence number, so we can handle
+# arbitrarily large files without overflow (at 64 KB chunks, 2^64 * 64 KB
+# is well over a zettabyte).
+CHUNK_HEADER = struct.Struct("!Q")
 
 
 def encode_file_chunk(seq: int, data: bytes) -> bytes:
     return encode(MsgType.FILE_CHUNK, CHUNK_HEADER.pack(seq) + data)
 
 
-def decode_file_chunk(body: bytes) -> tuple:
+def decode_file_chunk(body: bytes):
     if len(body) < CHUNK_HEADER.size:
         raise ValueError("FILE_CHUNK body too short")
     (seq,) = CHUNK_HEADER.unpack(body[: CHUNK_HEADER.size])

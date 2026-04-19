@@ -1,3 +1,5 @@
+"""Rendezvous server: matchmakes host/joiner pairs and exchanges their
+public endpoints (IP+port) and X25519 public keys."""
 import asyncio
 import json
 import logging
@@ -272,11 +274,19 @@ class RendezvousServer:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="bind address (default 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8888,
+                        help="bind port (default 8888)")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    server = RendezvousServer()
+    server = RendezvousServer(host=args.host, port=args.port)
     try:
         asyncio.run(server.serve_forever())
     except KeyboardInterrupt:

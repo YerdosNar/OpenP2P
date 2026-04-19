@@ -1,3 +1,6 @@
+"""UDP observer: each client sends a nonce-sized datagram from its UDP
+socket; the observer records (ip, port) it came from so we know the peer's
+NAT-visible endpoint."""
 import asyncio
 import logging
 from typing import Optional

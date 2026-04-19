@@ -27,5 +27,3 @@ certs/
 *~
 .DS_Store
 Thumbs.db
-
-test_*.py

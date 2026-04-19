@@ -1,3 +1,5 @@
+"""Room registry: a host creates a room with (id, pw, pubkey, ip, port),
+and a joiner can claim it by matching (id, pw). TTL is 3 minutes."""
 import asyncio
 import hmac
 import time

@@ -1,3 +1,4 @@
+"""Crypto primitives: X25519 key agreement + AES-256-GCM + HKDF-SHA256."""
 import os
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
