@@ -1,23 +1,4 @@
-"""Application layer on top of QUIC: mutual HMAC auth, chat, file transfer.
-
-Fixed bug: in the old version of _on_stream_data, a peer's first message
-(e.g. a CHAT frame) that arrived while *local* auth was still in progress
-would be buffered but its handler would never be spawned. Once auth
-completed, the stream was no longer "new", so the `if is_new and ...` check
-never fired again and the data was stranded.
-
-The fix separates "stream exists" (self._streams) from "handler spawned"
-(self._handled_streams) and adds a `_deferred_app_streams` set for any
-stream whose data arrived pre-auth, drained the moment auth succeeds.
-
-File transfer notes:
-  - No pre-send SHA-256 pass. The hash is computed streaming as we read +
-    send, then delivered in FILE_DONE. This is what makes 1 TB feasible --
-    the old code walked the whole file twice.
-  - 64 KB chunks, 64-bit sequence numbers (no practical size ceiling).
-  - We yield to the event loop every 16 chunks so QUIC can drain datagrams
-    and so flow control actually provides backpressure.
-"""
+"""Application layer on top of QUIC: mutual HMAC auth, chat, file transfer."""
 import asyncio
 import hashlib
 import hmac
@@ -41,13 +22,11 @@ log = logging.getLogger("peer.session")
 AUTH_CHALLENGE_SIZE = 32
 AUTH_TIMEOUT = 10.0
 FILE_CHUNK_SIZE = 64 * 1024
-BACKPRESSURE_YIELD_EVERY = 16
-PROGRESS_REPORT_BYTES = 16 * 1024 * 1024
+PROGRESS_REPORT_BYTES = 4 * 1024 * 1024
 DOWNLOAD_DIR = Path("./downloads")
 
 
 class StreamReader:
-    """In-memory framing over a single QUIC stream's byte stream."""
     def __init__(self):
         self._buf = bytearray()
         self._event = asyncio.Event()
@@ -78,6 +57,16 @@ class StreamReader:
         return await self.read_exactly(length)
 
 
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+
 class Session:
     def __init__(self, quic_peer, our_priv, peer_pubkey_bytes: bytes, is_host: bool):
         self._quic = quic_peer
@@ -92,12 +81,7 @@ class Session:
         self._chat_stream_id: Optional[int] = None
         self._post_auth = False
 
-        # Streams we've spawned an app-handler for. Separate from _streams so
-        # that pre-auth data doesn't prevent the handler from being spawned
-        # later.
         self._handled_streams = set()
-        # Streams whose data arrived before auth completed; drained once
-        # auth succeeds.
         self._deferred_app_streams = set()
 
         self._pending_incoming_files = {}
@@ -106,12 +90,7 @@ class Session:
         self._stop = asyncio.Event()
         self._ingress_tasks = []
 
-        # IMPORTANT: wire the callback up immediately so no data is dropped.
-        # QuicPeer buffers any pre-registration events; assigning here drains
-        # them.
         self._quic.on_stream_data = self._on_stream_data
-
-    # ---------- stream bookkeeping ----------
 
     def _get_or_create_stream(self, stream_id: int) -> StreamReader:
         reader = self._streams.get(stream_id)
@@ -158,8 +137,6 @@ class Session:
             return next(iter(self._streams))
         return None
 
-    # ---------- authentication ----------
-
     async def authenticate(self) -> bool:
         peer_pub_obj = X25519PublicKey.from_public_bytes(self._peer_pubkey_bytes)
         self._auth_key = crypto.derive_shared_key(
@@ -174,8 +151,6 @@ class Session:
                 log.error("auth: joiner never opened auth stream")
                 return False
             self._auth_stream_id = sid
-            # If this stream got deferred before we knew it was the auth
-            # stream, undo that.
             self._deferred_app_streams.discard(sid)
             reader = self._streams[sid]
 
@@ -249,8 +224,6 @@ class Session:
             log.info("auth: succeeded (joiner side)")
             return True
 
-    # ---------- app-stream dispatch ----------
-
     async def _handle_app_stream(self, stream_id: int, reader: StreamReader):
         try:
             first = await reader.read_frame()
@@ -275,8 +248,6 @@ class Session:
             self._stop.set()
         else:
             log.warning("stream %d: unexpected first message type %s", stream_id, mt)
-
-    # ---------- chat ----------
 
     def _ensure_chat_stream(self) -> int:
         if self._chat_stream_id is None:
@@ -326,8 +297,6 @@ class Session:
         text = obj.get("text", "")
         print(f"\n<peer> {text}\n> ", end="", flush=True)
 
-    # ---------- file transfer (unlimited size) ----------
-
     async def send_file(self, path: str) -> bool:
         p = Path(path)
         if not p.is_file():
@@ -336,7 +305,6 @@ class Session:
         size = p.stat().st_size
         name = p.name
 
-        # Fresh stream for this transfer.
         sid = self._quic.get_next_stream_id()
         reader = self._get_or_create_stream(sid)
         self._handled_streams.add(sid)
@@ -344,12 +312,10 @@ class Session:
         offer = encode_json(MsgType.FILE_OFFER, {
             "name": name,
             "size": size,
-            # Hash is computed streaming and sent in FILE_DONE, so a 1 TB
-            # file doesn't need a pre-send pass.
         })
         self._quic.send_stream(sid, frame(offer), end_stream=False)
 
-        print(f"[sent FILE_OFFER for {name} ({size} bytes)]")
+        print(f"[sent FILE_OFFER for {name} ({_fmt_bytes(size)})]")
 
         try:
             payload = await asyncio.wait_for(reader.read_frame(), 60.0)
@@ -382,14 +348,23 @@ class Session:
                 self._quic.send_stream(sid, frame(payload), end_stream=False)
                 seq += 1
                 sent += len(chunk)
-                if seq % BACKPRESSURE_YIELD_EVERY == 0:
-                    await asyncio.sleep(0)
-                if sent - last_report >= PROGRESS_REPORT_BYTES:
+
+                # Real backpressure: wait for aioquic's outgoing buffer to
+                # drain below the watermark before feeding it more. Without
+                # this, a 1.5 GB file would be read into memory faster than
+                # the wire can carry it away.
+                await self._quic.wait_for_drain()
+
+                if sent - last_report >= PROGRESS_REPORT_BYTES or sent == size:
                     pct = (sent / size * 100) if size else 100.0
                     mb_s = sent / (time.time() - t0 + 1e-9) / 1e6
-                    print(f"[sending {name}: {sent}/{size} bytes "
-                          f"({pct:.1f}%, {mb_s:.1f} MB/s)]")
+                    print(f"\r[sending {name}: {_fmt_bytes(sent)}/"
+                          f"{_fmt_bytes(size)} ({pct:.1f}%, {mb_s:.1f} MB/s)]",
+                          end="", flush=True)
                     last_report = sent
+
+        # Final drain before FILE_DONE so the receiver sees a clean end.
+        await self._quic.wait_for_drain()
 
         file_hash = h.hexdigest()
         done = encode_json(MsgType.FILE_DONE, {
@@ -400,7 +375,7 @@ class Session:
 
         elapsed = time.time() - t0
         mb_s = size / (elapsed + 1e-9) / 1e6
-        print(f"[file {name} sent: {seq} chunks, {elapsed:.1f}s, "
+        print(f"\n[file {name} sent: {seq} chunks, {elapsed:.1f}s, "
               f"{mb_s:.1f} MB/s, sha256={file_hash[:16]}...]")
         return True
 
@@ -413,7 +388,7 @@ class Session:
             log.warning("file: bad offer: %s", e)
             return
 
-        print(f"\n[peer offering file: {name} ({size} bytes)]")
+        print(f"\n[peer offering file: {name} ({_fmt_bytes(size)})]")
         print(f"> accept with /accept or reject with /reject", flush=True)
 
         decision_fut = asyncio.get_running_loop().create_future()
@@ -455,7 +430,8 @@ class Session:
                 try:
                     payload = await reader.read_frame()
                 except EOFError:
-                    print(f"\n[file {name}: stream closed early at {received}/{size}]")
+                    print(f"\n[file {name}: stream closed early at "
+                          f"{_fmt_bytes(received)}/{_fmt_bytes(size)}]")
                     return
                 try:
                     mt, body = decode(payload)
@@ -475,8 +451,8 @@ class Session:
                     if received - last_report >= PROGRESS_REPORT_BYTES:
                         pct = (received / size * 100) if size else 0.0
                         mb_s = received / (time.time() - t0 + 1e-9) / 1e6
-                        print(f"\n[receiving {name}: {received}/{size} bytes "
-                              f"({pct:.1f}%, {mb_s:.1f} MB/s)]\n> ",
+                        print(f"\r[receiving {name}: {_fmt_bytes(received)}/"
+                              f"{_fmt_bytes(size)} ({pct:.1f}%, {mb_s:.1f} MB/s)]",
                               end="", flush=True)
                         last_report = received
                 elif mt == MsgType.FILE_DONE:
@@ -493,7 +469,7 @@ class Session:
                               f"got {got_hash[:16]}..., expected {expected_hash[:16]}...]\n> ",
                               end="", flush=True)
                     else:
-                        print(f"\n[file received: {dest} ({received} bytes, "
+                        print(f"\n[file received: {dest} ({_fmt_bytes(received)}, "
                               f"{elapsed:.1f}s, {mb_s:.1f} MB/s, hash OK)]\n> ",
                               end="", flush=True)
                     return
@@ -518,12 +494,7 @@ class Session:
         print("[no pending file offer]")
         return False
 
-    # ---------- bye / shutdown ----------
-
     async def send_bye(self):
-        # If the user quits before sending anything, allocate a fresh stream
-        # so the peer actually learns we left instead of waiting for QUIC's
-        # idle timeout.
         sid = self._chat_stream_id
         if sid is None:
             try:

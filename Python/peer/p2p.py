@@ -1,23 +1,4 @@
-"""UDP hole punching and QUIC transport for a single peer-to-peer link.
-
-This module owns the UDP socket after rendezvous is complete. It:
-  1. Sprays a handful of packets toward the peer's observed endpoint to
-     open the NAT pinhole (punch_hole()).
-  2. Runs a QUIC connection over that same socket -- the host is the QUIC
-     server, the joiner is the QUIC client.
-
-Two bugs that used to live here and are now fixed:
-
-  (a) The timer loop only flushed outgoing QUIC datagrams on *timer* wake,
-      not on `send_stream()` wake. That meant chat messages queued by
-      Session.send_chat() could sit inside aioquic indefinitely on an
-      otherwise-idle link until some QUIC-internal timer fired.
-
-  (b) `StreamDataReceived` events that arrived before on_stream_data was
-      registered (i.e. between QUIC handshake completing and the caller
-      constructing a Session) were silently dropped. We now buffer them and
-      replay as soon as a handler is installed.
-"""
+"""UDP hole punching and QUIC transport for a single peer-to-peer link."""
 import asyncio
 import datetime
 import logging
@@ -49,9 +30,6 @@ QUIC_ALPN = ["p2p-chat/1"]
 
 
 def generate_selfsigned_cert():
-    """A throwaway cert for QUIC's TLS layer. Identity here is meaningless --
-    the Session layer does a real mutual HMAC auth over X25519-derived keys
-    after the QUIC handshake completes."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "p2p-peer"),
@@ -112,14 +90,18 @@ class QuicPeer:
         self._closed = False
         self._wake = asyncio.Event()
 
-        # Stream-data events that arrived before on_stream_data was registered
-        # are queued here and replayed the moment a handler is attached.
         self._stream_data_backlog = []
         self._on_stream_data = None
 
+        # Track bytes queued into aioquic per stream so send_file can
+        # apply real backpressure (wait for the wire to drain) instead of
+        # blasting a 1.5 GB file into memory.
+        self._stream_buffered = {}
+        self._drained_event = asyncio.Event()
+        self._drained_event.set()
+
         self.on_terminated = None
 
-    # `on_stream_data` is a property so that assigning it drains any backlog.
     @property
     def on_stream_data(self):
         return self._on_stream_data
@@ -144,6 +126,10 @@ class QuicPeer:
         config = QuicConfiguration(
             is_client=not self._is_host,
             alpn_protocols=QUIC_ALPN,
+            # Generous flow-control windows so a big file transfer
+            # doesn't stall on the default 1 MiB stream window.
+            max_data=256 * 1024 * 1024,
+            max_stream_data=64 * 1024 * 1024,
         )
         if self._is_host:
             cert_pem, key_pem = generate_selfsigned_cert()
@@ -207,13 +193,10 @@ class QuicPeer:
                 log.error("[%s] sock_recvfrom failed: %s", role, e)
                 return
 
-            # Ignore hole-punch packets and keepalives.
             if data.startswith(HOLEPUNCH_MAGIC):
                 continue
             if len(data) == 0:
                 continue
-            # NAT keepalive (single \x00 byte) sent by the rendezvous-era
-            # keepalive loop. Drop silently.
             if len(data) == 1 and data == b"\x00":
                 continue
 
@@ -236,11 +219,9 @@ class QuicPeer:
             self._quic.receive_datagram(data, addr, now=self._now())
             await self._process_quic_events()
             await self._flush_out()
+            self._update_drain_state()
 
     async def _timer_loop(self) -> None:
-        # Wakes on either (a) a QUIC timer firing, or (b) send_stream() setting
-        # `_wake`. Either way it MUST pump events + flush outgoing datagrams,
-        # otherwise queued stream data can sit idle inside aioquic.
         while not self._closed:
             if self._quic is None:
                 try:
@@ -260,13 +241,13 @@ class QuicPeer:
                 pass
             self._wake.clear()
 
-            # Fire the QUIC timer only if it's actually due.
             t = self._quic.get_timer()
             if t is not None and t <= self._now():
                 self._quic.handle_timer(now=self._now())
 
             await self._process_quic_events()
             await self._flush_out()
+            self._update_drain_state()
 
     async def _flush_out(self) -> None:
         loop = asyncio.get_running_loop()
@@ -287,6 +268,59 @@ class QuicPeer:
             log.debug("[%s] TX %d datagrams (%d bytes) to %s",
                       role, count, total_bytes, self._peer_addr)
 
+    def _update_drain_state(self) -> None:
+        # Best-effort snapshot of what aioquic still has buffered for each
+        # stream. If a stream's internal buffer has shrunk below what we
+        # recorded, reduce our counter accordingly.
+        if self._quic is None:
+            return
+        streams = getattr(self._quic, "_streams", None)
+        if streams is None:
+            return
+        for sid, tracked in list(self._stream_buffered.items()):
+            s = streams.get(sid)
+            if s is None:
+                self._stream_buffered.pop(sid, None)
+                continue
+            sender = getattr(s, "sender", None)
+            if sender is None:
+                continue
+            buffered = getattr(sender, "buffer_len", None)
+            if buffered is None:
+                buf = getattr(sender, "_buffer", None)
+                if buf is not None:
+                    try:
+                        buffered = len(buf)
+                    except Exception:
+                        buffered = None
+            if buffered is None:
+                continue
+            if buffered < tracked:
+                self._stream_buffered[sid] = buffered
+
+        if self._total_buffered() < self._drain_low_watermark:
+            self._drained_event.set()
+
+    _drain_high_watermark = 8 * 1024 * 1024
+    _drain_low_watermark = 2 * 1024 * 1024
+
+    def _total_buffered(self) -> int:
+        return sum(self._stream_buffered.values())
+
+    async def wait_for_drain(self) -> None:
+        # Block the producer until aioquic's outgoing buffer has shrunk
+        # back down. This is the backpressure that lets us send a 1.5 GB
+        # file without holding it all in RAM.
+        while not self._closed:
+            if self._total_buffered() < self._drain_high_watermark:
+                return
+            self._drained_event.clear()
+            self._wake.set()
+            try:
+                await asyncio.wait_for(self._drained_event.wait(), 1.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def _process_quic_events(self) -> None:
         role = "host" if self._is_host else "joiner"
         if self._quic is None:
@@ -306,7 +340,6 @@ class QuicPeer:
                         event.stream_id, event.data, event.end_stream
                     )
                 else:
-                    # Buffer until Session registers a handler.
                     self._stream_data_backlog.append(
                         (event.stream_id, event.data, event.end_stream)
                     )
@@ -323,6 +356,7 @@ class QuicPeer:
                     await self.on_terminated(event.reason_phrase)
                 self._closed = True
                 self._wake.set()
+                self._drained_event.set()
                 return
 
     def send_stream(
@@ -330,6 +364,11 @@ class QuicPeer:
     ) -> None:
         assert self._quic is not None
         self._quic.send_stream_data(stream_id, data, end_stream=end_stream)
+        self._stream_buffered[stream_id] = (
+            self._stream_buffered.get(stream_id, 0) + len(data)
+        )
+        if self._total_buffered() >= self._drain_high_watermark:
+            self._drained_event.clear()
         self._wake.set()
 
     def get_next_stream_id(self) -> int:
@@ -345,3 +384,4 @@ class QuicPeer:
                 pass
         self._closed = True
         self._wake.set()
+        self._drained_event.set()
