@@ -1,6 +1,7 @@
 #include "../include/crypto.h"
 #include "../include/net.h"
 #include "../include/logger.h"
+#include "../include/msgtype.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,11 @@ fail:
 
 /* ── encrypt and send ───────────────────────────────────────────────────── */
 
+/*
+ * Encrypt 'len' bytes from 'data' and send one packet on 'fd'.
+ * 'data' is treated as an opaque blob; the caller is responsible for
+ * any application-level framing (e.g. a leading type byte).
+ */
 static bool encrypt_send_raw(
         int32_t        fd,
         const uint8_t *data,
@@ -126,6 +132,11 @@ static bool encrypt_send_raw(
 
 /* ── receive and decrypt ────────────────────────────────────────────────── */
 
+/*
+ * Receive one packet on 'fd' and decrypt into a freshly-allocated buffer.
+ * *out_data gets (plaintext_len + 1) bytes; the extra byte is set to 0
+ * so the buffer is safe to treat as a C string when the payload is text.
+ */
 static bool recv_decrypt_raw(
         int32_t   fd,
         uint8_t **out_data,
@@ -186,6 +197,7 @@ static bool recv_decrypt_raw(
                 return false;
         }
 
+        plaintext[actual_plen] = '\0';
         *out_data = plaintext;
         *out_len  = (uint32_t)actual_plen;
         return true;
@@ -224,5 +236,19 @@ bool crypto_recv_decrypt_bin(
         uint32_t      *out_len,
         const Session *s)
 {
-        return recv_decrypt_raw(fd, out_data, out_len, s);
+        uint8_t type;
+
+        if (!crypto_recv_typed(fd, &type, out_data, out_len, s)) {
+                return false;
+        }
+
+        if (type != MSG_CHAT) {
+                err("Unexpected message type 0x%02x on chat channel.\n", type);
+                free(*out_data);
+                *out_data = NULL;
+                *out_len  = 0;
+                return false;
+        }
+
+        return true;
 }

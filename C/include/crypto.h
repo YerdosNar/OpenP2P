@@ -20,6 +20,15 @@
  *   [ ciphertext+MAC                         ]
  *
  * The MAC (ABYTES=16) is appended by libsodium inside the ciphertext buffer.
+ *
+ * Plaintext layout (INSIDE the ciphertext):
+ *
+ *   [ type (1 byte) ][ payload ... ]
+ *
+ * The type byte is authenticated by Poly1305 along with the payload.
+ * See msgtype.h for defined values. The _send/_recv helpers below use
+ * MSG_CHAT implicitly; use crypto_send_typed / crypto_recv_typed when
+ * you need to send or inspect other message types.
  */
 
 /* ── session key type ────────────────────────────────────────────────────── */
@@ -101,6 +110,46 @@ bool crypto_encrypt_send_bin(
  */
 bool crypto_recv_decrypt_bin(
         int32_t        fd,
+        uint8_t      **out_data,
+        uint32_t      *out_len,
+        const Session *s);
+
+/* typed variants */
+/*
+ * Encrypt and send a message with an explicit type byte.
+ *
+ * The type is prepended to 'data' inside the plaintext, so it is
+ * authenticated by Poly1305 along with the payload.
+ *
+ * 'data' may be NULL if 'len' is 0 (for empty-payload types like
+ * FILE_ACCEPT / FILE_REJECT / FILE_EOF).
+ *
+ * Returns true on success.
+ */
+bool crypto_send_typed(
+                int32_t         fd,
+                uint8_t         type,
+                const uint8_t   *data,
+                uint32_t        len,
+                const Session *);
+
+/*
+ * Receive and decrypt one packet, returning the type byte and payload
+ * separately.
+ *
+ * On success:
+ *   *out_type is set to the type byte
+ *   *out_data points to a heap-allocated payload (caller must free,
+ *             even when *out_len = 0 - the buffer still carries a
+ *             trailing NUL so it is safe to treat as a C string when
+ *             the type is MSG_CHAT)
+ *   *out_len is the payload length in bytes, NOT including the type
+ *
+ * Returns true on success, false on any transport or decryption error.
+ */
+bool crypto_recv_typed(
+        int32_t        fd,
+        uint8_t       *out_type,
         uint8_t      **out_data,
         uint32_t      *out_len,
         const Session *s);
