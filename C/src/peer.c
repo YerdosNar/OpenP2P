@@ -5,6 +5,12 @@
  */
 #define _FILE_OFFSET_BITS 64
 
+/*
+ * Request POSIX.1-2008 feature macros. Needed so <time.h> exposes
+ * clock_gettime() and CLOCK_MONOTONIC for the progress timer.
+ */
+#define _POSIX_C_SOURCE 200809L
+
 #include <netdb.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -14,6 +20,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -106,14 +115,24 @@ typedef struct {
 
 /*
  * Receiver-side bookkeeping for an in-progress file write.
+ *
+ * We write to a '.part' file during the transfer and rename() it to
+ * the final path on a clean MSG_FILE_END that matches expected_size.
+ * On any abort, the .part file is left on disk -- the extension tells
+ * the user it's incomplete.
+ *
  * Opened by the y-branch of prompt_while_offered, written by
- * handle_recv_file_chunk, closed by handle_recv_file_end.
+ * handle_recv_file_chunk, closed (and renamed on success) by
+ * handle_recv_file_end.
  */
 typedef struct {
         FILE    *fp;                        /* NULL when no transfer active  */
-        char     final_path[1024];          /* where we're actually writing  */
+        char     part_path[1024 + 8];       /* where bytes land during xfer  */
+        char     final_path[1024];          /* where we rename to on END     */
         uint64_t expected_size;             /* as promised in the offer      */
         uint64_t received;                  /* running total, <= expected    */
+        uint64_t start_ms;                  /* CLOCK_MONOTONIC at first chunk*/
+        uint64_t last_progress_ms;          /* progress-printer rate limit   */
 } RecvFileState;
 
 typedef struct {
@@ -126,6 +145,19 @@ typedef struct {
         PendingOffer        pending;
         SendingState        sending;
         RecvFileState       recv_file;
+
+        /*
+         * Self-pipe wakeup. recv_thread writes one byte to wake_w
+         * whenever it changes state; the main thread's poll() on
+         * {stdin_fd, wake_r} then returns and the prompt helpers
+         * can re-check state instead of remaining blocked on stdin.
+         *
+         *   wake_w is set O_NONBLOCK so a full pipe never blocks
+         *   recv_thread -- if the byte can't be written, the main
+         *   thread is already scheduled to wake up anyway.
+         */
+        int32_t             wake_r;
+        int32_t             wake_w;
 } ChatCtx;
 
 static void resolve_domain(const char *domain, char *out_ip)
@@ -369,7 +401,123 @@ static void recv_print_notice(const char *fmt, ...)
 }
 
 /*
- * Handle FILE_OFFER. Parses the payload, stashes the metadata
+ * Wake the main thread out of its poll() on stdin + wake_r.
+ *
+ * Called from recv_thread whenever it changes ctx->state in a way
+ * the main thread should react to (e.g. ACCEPT arrived, OFFER
+ * arrived, transfer completed, disconnect).
+ *
+ * The byte value is meaningless -- the pipe is a doorbell, not a
+ * mailbox. The state details live in ctx->state (already atomic).
+ *
+ * Writes are non-blocking: if the pipe happens to be full, the main
+ * thread is already pending wakeup, so losing a byte doesn't matter.
+ */
+static void wake_main(ChatCtx *ctx)
+{
+        if (ctx->wake_w < 0) return;
+        uint8_t byte = 1;
+        ssize_t n = write(ctx->wake_w, &byte, 1);
+        (void)n;   /* EAGAIN is fine, any error is fine -- see rationale above */
+}
+
+/*
+ * Drain any pending bytes from the wake pipe. Called after a poll()
+ * reports wake_r readable, so that a single poll wakeup suffices for
+ * any number of state changes that may have piled up in the pipe.
+ */
+static void drain_wake_pipe(ChatCtx *ctx)
+{
+        uint8_t buf[64];
+        while (read(ctx->wake_r, buf, sizeof(buf)) > 0) { /* spin */ }
+}
+
+/*
+ * Possible results from wait_for_line_or_wake().
+ */
+typedef enum {
+        INPUT_GOT_LINE,   /* a full \n-terminated line is in 'line' (NUL-term) */
+        INPUT_WOKEN,      /* recv_thread poked the pipe; state may have changed */
+        INPUT_EOF,        /* stdin closed (Ctrl-D); caller should shut down    */
+        INPUT_ERROR,      /* poll/read error                                    */
+} InputResult;
+
+/*
+ * Wait until either:
+ *   - the user finishes typing a line (returns INPUT_GOT_LINE), or
+ *   - recv_thread wakes us via the pipe (returns INPUT_WOKEN).
+ *
+ * 'line' is a caller-provided buffer of 'cap' bytes. On GOT_LINE it
+ * contains a NUL-terminated string with the trailing newline already
+ * stripped (behaviour matches fgets + net_strip_newline).
+ *
+ * This replaces fgets() in the prompt helpers, because fgets blocks
+ * stdin and can't be interrupted by a peer event.
+ *
+ * Implementation: small state machine. We poll() on stdin and wake_r.
+ * On stdin readability, we read one byte and append it to 'line'.
+ * We stop on '\n' (line complete) or buffer full. EOF on stdin returns
+ * INPUT_EOF. Any byte on wake_r returns INPUT_WOKEN -- which means we
+ * may have half a line buffered; the caller is expected to re-check
+ * state, and if we return to this function later, the partial line
+ * is lost. That's fine in practice: state transitions happen between
+ * turns, not while the user is mid-typing.
+ */
+static InputResult wait_for_line_or_wake(ChatCtx *ctx, char *line, size_t cap)
+{
+        if (cap < 2) return INPUT_ERROR;
+
+        size_t pos = 0;
+        line[0] = '\0';
+
+        for (;;) {
+                struct pollfd pfds[2] = {
+                        { .fd = STDIN_FILENO, .events = POLLIN },
+                        { .fd = ctx->wake_r,  .events = POLLIN },
+                };
+
+                int pr = poll(pfds, 2, -1);   /* block indefinitely */
+                if (pr < 0) {
+                        if (errno == EINTR) continue;
+                        return INPUT_ERROR;
+                }
+
+                /* Wake pipe is checked FIRST so a state change that
+                 * raced with a final newline still gets prioritised. */
+                if (pfds[1].revents & POLLIN) {
+                        drain_wake_pipe(ctx);
+                        return INPUT_WOKEN;
+                }
+
+                if (pfds[0].revents & (POLLIN | POLLHUP)) {
+                        /*
+                         * Read one byte at a time. stdin on a TTY is
+                         * usually line-buffered by the kernel, so this
+                         * isn't a syscall storm in practice, and it
+                         * keeps the logic trivial.
+                         */
+                        char c;
+                        ssize_t n = read(STDIN_FILENO, &c, 1);
+                        if (n == 0) return INPUT_EOF;
+                        if (n < 0) {
+                                if (errno == EINTR) continue;
+                                return INPUT_ERROR;
+                        }
+                        if (c == '\n' || c == '\r') {
+                                line[pos] = '\0';
+                                return INPUT_GOT_LINE;
+                        }
+                        if (pos + 1 < cap) {
+                                line[pos++] = c;
+                                line[pos] = '\0';
+                        }
+                        /* else: silently drop extra bytes */
+                }
+        }
+}
+
+/*
+ * Handle MSG_FILE_OFFER. Parses the payload, stashes the metadata
  * in ctx->pending, and transitions state CHAT -> OFFERED.
  *
  * If we're not in CHAT (e.g. we have our own offer outstanding),
@@ -412,6 +560,7 @@ static void handle_recv_file_offer(ChatCtx *ctx,
 
         atomic_store_explicit(&ctx->state, CHAT_STATE_OFFERED,
                               memory_order_release);
+        wake_main(ctx);
 
         recv_print_notice(BMGN "[offer]" NOC
                           " %s wants to send '%s' (%" PRIu64 " bytes).\n",
@@ -434,15 +583,15 @@ static void handle_recv_file_accept(ChatCtx *ctx)
                 return;
         }
         /*
-         * Transition to SENDING. The main thread's prompt_while_awaiting_accept
-         * will notice this on its next stdin wakeup (when the user hits Enter)
-         * and dispatch to do_send_file_chunks. This stdin-wakeup dependency
-         * is documented; a self-pipe wakeup is Step 8 territory.
+         * Transition to SENDING. Wake the main thread so it can leave
+         * the "[waiting for peer]" prompt and enter the chunk loop
+         * without waiting for the user to press Enter.
          */
         atomic_store_explicit(&ctx->state, CHAT_STATE_SENDING,
                               memory_order_release);
+        wake_main(ctx);
         recv_print_notice(BGRN "[ok]" NOC
-                          " Peer accepted. Press Enter to start sending.\n");
+                          " Peer accepted. Starting transfer...\n");
 }
 
 static void handle_recv_file_reject(ChatCtx *ctx)
@@ -456,6 +605,7 @@ static void handle_recv_file_reject(ChatCtx *ctx)
         }
         atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
                               memory_order_release);
+        wake_main(ctx);
         recv_print_notice(BYEL "[!]" NOC " Peer rejected the offer.\n");
 }
 
@@ -511,6 +661,97 @@ static bool resolve_output_path(const char *name,
         return false;
 }
 
+/* ── progress display ──────────────────────────────────────────────────────
+ *
+ * Rate-limited progress printer for file transfers. Writes a single
+ * line prefixed with \r\033[2K so successive calls overwrite the same
+ * line instead of scrolling. Caller emits a final '\n' when the
+ * transfer completes so the next line starts fresh.
+ *
+ * We use CLOCK_MONOTONIC (never CLOCK_REALTIME / time()) for elapsed
+ * calculations: monotonic is immune to NTP adjustments and DST.
+ */
+
+#define PROGRESS_MIN_INTERVAL_MS  200U
+
+static uint64_t now_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000u
+             + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/*
+ * Write a human-readable byte count into 'out' ("1.23 MB"). Always
+ * picks the largest unit that yields a value >= 1.
+ */
+static void fmt_bytes(char *out, size_t cap, uint64_t bytes)
+{
+        static const char *units[] = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double b = (double)bytes;
+        size_t u = 0;
+        while (b >= 1024.0 && u + 1 < sizeof(units)/sizeof(units[0])) {
+                b /= 1024.0;
+                u++;
+        }
+        if (u == 0) snprintf(out, cap, "%" PRIu64 " B", bytes);
+        else        snprintf(out, cap, "%.2f %s", b, units[u]);
+}
+
+/*
+ * Print a progress line if at least PROGRESS_MIN_INTERVAL_MS have
+ * passed since *last_ms, or if force is true. Updates *last_ms.
+ *
+ * label    : "[sending]" or "[receiving]" tag shown at left
+ * name     : the filename being transferred
+ * done, total : byte counters (0 <= done <= total)
+ * start_ms : when the transfer began, for rate + ETA
+ */
+static void progress_maybe_print(
+        uint64_t   *last_ms,
+        bool        force,
+        const char *label,
+        const char *name,
+        uint64_t    done,
+        uint64_t    total,
+        uint64_t    start_ms)
+{
+        uint64_t now = now_ms();
+        if (!force && now - *last_ms < PROGRESS_MIN_INTERVAL_MS) return;
+        *last_ms = now;
+
+        double elapsed_s = (double)(now - start_ms) / 1000.0;
+        if (elapsed_s < 0.001) elapsed_s = 0.001;
+
+        double rate_bps = (double)done / elapsed_s;
+        int pct = (total > 0) ? (int)((done * 100u) / total) : 0;
+
+        char done_s[32], total_s[32], rate_s[32];
+        fmt_bytes(done_s,  sizeof(done_s),  done);
+        fmt_bytes(total_s, sizeof(total_s), total);
+        fmt_bytes(rate_s,  sizeof(rate_s),  (uint64_t)rate_bps);
+
+        /* ETA: based on current average rate. Only shown while in progress. */
+        char eta_s[32] = "";
+        if (done < total && rate_bps > 1.0) {
+                uint64_t remaining = total - done;
+                uint64_t eta_sec = (uint64_t)((double)remaining / rate_bps);
+                if (eta_sec < 60)
+                        snprintf(eta_s, sizeof(eta_s), "ETA %" PRIu64 "s", eta_sec);
+                else if (eta_sec < 3600)
+                        snprintf(eta_s, sizeof(eta_s), "ETA %" PRIu64 "m %" PRIu64 "s",
+                                 eta_sec / 60, eta_sec % 60);
+                else
+                        snprintf(eta_s, sizeof(eta_s), "ETA %" PRIu64 "h %" PRIu64 "m",
+                                 eta_sec / 3600, (eta_sec % 3600) / 60);
+        }
+
+        printf("\r\033[2K%s %s  %s / %s  (%d%%)  %s/s  %s",
+               label, name, done_s, total_s, pct, rate_s, eta_s);
+        fflush(stdout);
+}
+
 /* ── sender-side chunk loop ───────────────────────────────────────────────
  *
  * Called from prompt_while_awaiting_accept AFTER state has become
@@ -542,25 +783,24 @@ static bool do_send_file_chunks(ChatCtx *ctx)
              ctx->sending.basename, size);
 
         uint8_t  buf[FILEPROTO_CHUNK_SIZE];
-        uint64_t sent = 0;
-        bool     ok   = true;
-        time_t   t0   = time(NULL);
+        uint64_t sent      = 0;
+        bool     ok        = true;
+        uint64_t t0        = now_ms();
+        uint64_t last_prog = 0;
+
+        /* Force an initial 0% line so the user sees immediate feedback. */
+        progress_maybe_print(&last_prog, true,
+                             BCYN "[sending]" NOC,
+                             ctx->sending.basename, 0, size, t0);
 
         while (sent < size) {
-                /*
-                 * Read at most min(CHUNK_SIZE, size-sent) bytes. The
-                 * size cap matters on the final chunk: if the file on
-                 * disk grew or shrank between stat() and now, we stick
-                 * to the size we promised in the offer. Mismatch is
-                 * handled as a truncated read below.
-                 */
                 size_t want = FILEPROTO_CHUNK_SIZE;
                 uint64_t remaining = size - sent;
                 if (remaining < want) want = (size_t)remaining;
 
                 size_t got = fread(buf, 1, want, fp);
                 if (got == 0) {
-                        err("Short read on '%s' at offset %" PRIu64
+                        err("\nShort read on '%s' at offset %" PRIu64
                             " (file shrank?).\n", path, sent);
                         ok = false;
                         break;
@@ -568,13 +808,24 @@ static bool do_send_file_chunks(ChatCtx *ctx)
 
                 if (!fileproto_send_chunk(ctx->fd, buf, (uint32_t)got,
                                           ctx->session)) {
-                        err("Failed to send chunk at offset %" PRIu64 ".\n", sent);
+                        err("\nFailed to send chunk at offset %" PRIu64 ".\n", sent);
                         ok = false;
                         break;
                 }
 
                 sent += got;
+                progress_maybe_print(&last_prog, false,
+                                     BCYN "[sending]" NOC,
+                                     ctx->sending.basename, sent, size, t0);
         }
+
+        /* Final progress line showing 100%, then newline so subsequent
+         * log output doesn't stomp on it. */
+        progress_maybe_print(&last_prog, true,
+                             BCYN "[sending]" NOC,
+                             ctx->sending.basename, sent, size, t0);
+        printf("\n");
+        fflush(stdout);
 
         fclose(fp);
 
@@ -589,11 +840,13 @@ static bool do_send_file_chunks(ChatCtx *ctx)
                               memory_order_release);
 
         if (ok) {
-                time_t dt = time(NULL) - t0;
-                if (dt < 1) dt = 1;
-                double mbps = ((double)sent / (1024.0 * 1024.0)) / (double)dt;
-                success("Sent '%s' (%" PRIu64 " bytes) in %lds (~%.1f MB/s).\n",
-                        ctx->sending.basename, sent, (long)dt, mbps);
+                uint64_t dt_ms = now_ms() - t0;
+                if (dt_ms < 1) dt_ms = 1;
+                double mbps = ((double)sent / (1024.0 * 1024.0))
+                            / ((double)dt_ms / 1000.0);
+                success("Sent '%s' (%" PRIu64 " bytes) in %.1fs (~%.1f MB/s).\n",
+                        ctx->sending.basename, sent,
+                        (double)dt_ms / 1000.0, mbps);
         } else {
                 err("Transfer of '%s' aborted after %" PRIu64 " bytes.\n",
                     ctx->sending.basename, sent);
@@ -613,11 +866,21 @@ static void abort_recv_file(ChatCtx *ctx, const char *why)
         if (ctx->recv_file.fp) {
                 fclose(ctx->recv_file.fp);
                 ctx->recv_file.fp = NULL;
-                /* Leave the partial file on disk so the user can inspect
-                 * it; naming it ".part" is Step 8 territory. */
+                /* Leave the .part file on disk. The .part extension is
+                 * the marker of incompleteness -- do NOT rename it to
+                 * the final name, because the data is not whole. */
+                atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                      memory_order_release);
+                wake_main(ctx);
+                recv_print_notice(BRED "[x]" NOC
+                                  " File receive aborted: %s"
+                                  " (partial data in '%s').\n",
+                                  why, ctx->recv_file.part_path);
+                return;
         }
         atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
                               memory_order_release);
+        wake_main(ctx);
         recv_print_notice(BRED "[x]" NOC " File receive aborted: %s\n", why);
 }
 
@@ -649,6 +912,13 @@ static void handle_recv_file_chunk(ChatCtx *ctx,
                 return;
         }
         ctx->recv_file.received += len;
+
+        progress_maybe_print(&ctx->recv_file.last_progress_ms, false,
+                             BCYN "[receiving]" NOC,
+                             ctx->recv_file.final_path,
+                             ctx->recv_file.received,
+                             ctx->recv_file.expected_size,
+                             ctx->recv_file.start_ms);
 }
 
 static void handle_recv_file_end(ChatCtx *ctx)
@@ -663,6 +933,7 @@ static void handle_recv_file_end(ChatCtx *ctx)
         if (ctx->recv_file.fp == NULL) {
                 atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
                                       memory_order_release);
+                wake_main(ctx);
                 return;
         }
 
@@ -674,16 +945,43 @@ static void handle_recv_file_end(ChatCtx *ctx)
 
         atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
                               memory_order_release);
+        wake_main(ctx);
 
         if (got == want) {
+                /* Make sure the final 100% line is on screen before we
+                 * scroll past it with the success message. */
+                progress_maybe_print(&ctx->recv_file.last_progress_ms, true,
+                                     BCYN "[receiving]" NOC,
+                                     ctx->recv_file.final_path,
+                                     got, want, ctx->recv_file.start_ms);
+                printf("\n");
+                fflush(stdout);
+
+                /*
+                 * Promote the .part file to its final name. rename() is
+                 * atomic on POSIX when source and destination are on the
+                 * same filesystem, so observers never see a half-named file.
+                 */
+                if (rename(ctx->recv_file.part_path,
+                           ctx->recv_file.final_path) != 0)
+                {
+                        recv_print_notice(BRED "[x]" NOC
+                                          " Received OK but rename '%s' -> '%s' failed;"
+                                          " data remains as .part file.\n",
+                                          ctx->recv_file.part_path,
+                                          ctx->recv_file.final_path);
+                        return;
+                }
                 recv_print_notice(BGRN "[ok]" NOC
                                   " Received '%s' (%" PRIu64 " bytes).\n",
                                   ctx->recv_file.final_path, got);
         } else {
                 recv_print_notice(BRED "[x]" NOC
-                                  " Truncated receive of '%s': %" PRIu64
-                                  " / %" PRIu64 " bytes on disk.\n",
-                                  ctx->recv_file.final_path, got, want);
+                                  " Truncated receive of '%s':"
+                                  " %" PRIu64 " / %" PRIu64 " bytes."
+                                  " Partial data left in '%s'.\n",
+                                  ctx->recv_file.final_path, got, want,
+                                  ctx->recv_file.part_path);
         }
 }
 
@@ -699,8 +997,15 @@ static  void *recv_thread(void *arg)
                 if (!crypto_recv_typed(ctx->fd, &type, &payload, &len, ctx->session)) {
                         if (ctx->running) {
                                 ctx->running = false;
+                                /* If we were mid-receive, close the file and
+                                 * leave the .part behind so data isn't lost. */
+                                if (ctx->recv_file.fp) {
+                                        abort_recv_file(ctx,
+                                                        "peer disconnected mid-transfer");
+                                }
                                 printf("\n[%s disconnected.]\n", ctx->peer_name);
                                 shutdown(ctx->fd, SHUT_RDWR);
+                                wake_main(ctx);
                         }
                         free(payload);
                         break;
@@ -897,23 +1202,32 @@ static bool prompt_while_awaiting_accept(ChatCtx *ctx)
         char buf[256];
         printf(BYEL "[waiting for peer]" NOC ": ");
         fflush(stdout);
-        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+
+        InputResult r = wait_for_line_or_wake(ctx, buf, sizeof(buf));
+
+        if (r == INPUT_EOF) {
                 ctx->running = false;
                 printf("\n[You left the chat.]\n");
                 shutdown(ctx->fd, SHUT_RDWR);
                 return false;
         }
+        if (r == INPUT_ERROR) {
+                return false;
+        }
+
         /*
-         * While we were blocked on fgets, recv_thread may have received
-         * ACCEPT (state -> SENDING) or REJECT (state -> CHAT). If we're
-         * now in SENDING, drive the chunk loop from this thread.
+         * Whether we got a line, or were just woken, we re-check state.
+         * If recv_thread transitioned us to SENDING (peer accepted),
+         * we dispatch to the chunk loop immediately -- no more waiting
+         * for the user to hit Enter.
          */
         ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
         if (s == CHAT_STATE_SENDING) {
                 return do_send_file_chunks(ctx);
         }
-        /* Otherwise: discard. State will change when recv_thread processes
-         * ACCEPT or REJECT. */
+        /* Else: state is still AWAITING_ACCEPT (user typed while waiting
+         * and nothing changed), or CHAT (reject arrived). Either way,
+         * return to send_loop which will re-evaluate state. */
         return true;
 }
 
@@ -930,13 +1244,28 @@ static bool prompt_while_offered(ChatCtx *ctx)
                ctx->pending.filename, ctx->pending.filesize);
         fflush(stdout);
 
-        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+        InputResult r = wait_for_line_or_wake(ctx, buf, sizeof(buf));
+
+        if (r == INPUT_EOF) {
                 ctx->running = false;
                 printf("\n[You left the chat.]\n");
                 shutdown(ctx->fd, SHUT_RDWR);
                 return false;
         }
-        net_strip_newline(buf);
+        if (r == INPUT_ERROR) {
+                return false;
+        }
+        if (r == INPUT_WOKEN) {
+                /*
+                 * Woken without a line: some state change happened (e.g.
+                 * sender withdrew? currently impossible, but forward-
+                 * compatible with a future CANCEL). Just return and let
+                 * send_loop re-evaluate state.
+                 */
+                return true;
+        }
+        /* r == INPUT_GOT_LINE; 'buf' holds the user's answer (already NUL-
+         * terminated with newline stripped by the helper). */
 
         if (buf[0] == 'y' || buf[0] == 'Y') {
                 /*
@@ -961,9 +1290,25 @@ static bool prompt_while_offered(ChatCtx *ctx)
                         return true;
                 }
 
-                FILE *fp = fopen(out_path, "wb");
+                /*
+                 * Write to <final>.part during the transfer. On a clean
+                 * END that matches expected_size, we'll rename() to
+                 * out_path. On abort, the .part file is left behind so
+                 * the user has evidence without mistaking it for complete.
+                 */
+                char part_path[sizeof(((RecvFileState *)0)->part_path)];
+                int n = snprintf(part_path, sizeof(part_path), "%s.part", out_path);
+                if (n < 0 || (size_t)n >= sizeof(part_path)) {
+                        err("Path too long to append '.part' suffix.\n");
+                        fileproto_send_reject(ctx->fd, ctx->session);
+                        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                              memory_order_release);
+                        return true;
+                }
+
+                FILE *fp = fopen(part_path, "wb");
                 if (!fp) {
-                        err("Cannot open '%s' for writing.\n", out_path);
+                        err("Cannot open '%s' for writing.\n", part_path);
                         fileproto_send_reject(ctx->fd, ctx->session);
                         atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
                                               memory_order_release);
@@ -972,9 +1317,14 @@ static bool prompt_while_offered(ChatCtx *ctx)
 
                 /* Prime recv_file BEFORE publishing RECEIVING, so the next
                  * CHUNK that arrives on recv_thread can find fp != NULL. */
-                ctx->recv_file.fp            = fp;
-                ctx->recv_file.expected_size = ctx->pending.filesize;
-                ctx->recv_file.received      = 0;
+                ctx->recv_file.fp               = fp;
+                ctx->recv_file.expected_size    = ctx->pending.filesize;
+                ctx->recv_file.received         = 0;
+                ctx->recv_file.start_ms         = now_ms();
+                ctx->recv_file.last_progress_ms = 0;
+                strncpy(ctx->recv_file.part_path, part_path,
+                        sizeof(ctx->recv_file.part_path) - 1);
+                ctx->recv_file.part_path[sizeof(ctx->recv_file.part_path) - 1] = '\0';
                 strncpy(ctx->recv_file.final_path, out_path,
                         sizeof(ctx->recv_file.final_path) - 1);
                 ctx->recv_file.final_path[sizeof(ctx->recv_file.final_path) - 1] = '\0';
@@ -1218,9 +1568,49 @@ int main(int argc, char **argv)
                 .peer_name      = peer_name,
                 .running        = true,
                 .state          = CHAT_STATE_CHAT,
+                .wake_r         = -1,
+                .wake_w         = -1,
                 /* .pending, .sending, .recv_file are zero-initialised by
                  * C's designated-init rule: all unmentioned fields get 0. */
         };
+
+        /*
+         * Create the self-pipe used by recv_thread to wake the main
+         * thread out of its input poll() on asynchronous state changes.
+         * Non-blocking on the write end so a recv_thread poke never
+         * stalls if the main thread is slow to drain the pipe.
+         */
+        int wake_fds[2];
+        if (pipe(wake_fds) != 0) {
+                err("pipe() failed for self-pipe wakeup.\n");
+                close(p2p_fd);
+                free(peer_name);
+                return 1;
+        }
+        int wflags = fcntl(wake_fds[1], F_GETFL, 0);
+        if (wflags == -1 || fcntl(wake_fds[1], F_SETFL, wflags | O_NONBLOCK) == -1) {
+                err("fcntl(O_NONBLOCK) failed on wake pipe.\n");
+                close(wake_fds[0]);
+                close(wake_fds[1]);
+                close(p2p_fd);
+                free(peer_name);
+                return 1;
+        }
+        /*
+         * Also make the read end non-blocking so the drain loop can
+         * consume all pending bytes and stop cleanly on EAGAIN.
+         */
+        int rflags = fcntl(wake_fds[0], F_GETFL, 0);
+        if (rflags == -1 || fcntl(wake_fds[0], F_SETFL, rflags | O_NONBLOCK) == -1) {
+                err("fcntl(O_NONBLOCK) failed on wake pipe read end.\n");
+                close(wake_fds[0]);
+                close(wake_fds[1]);
+                close(p2p_fd);
+                free(peer_name);
+                return 1;
+        }
+        chat.wake_r = wake_fds[0];
+        chat.wake_w = wake_fds[1];
 
         pthread_t rtid;
         if (pthread_create(&rtid, NULL, recv_thread, &chat) != 0) {
@@ -1236,9 +1626,22 @@ int main(int argc, char **argv)
         /* wait for the receiver to finish */
         pthread_join(rtid, NULL);
 
+        /*
+         * Final safety net: if a transfer was in progress when the
+         * program exited, close the file handle so buffered data is
+         * at least flushed. recv_thread's disconnect handler normally
+         * covers this already; this is defence-in-depth.
+         */
+        if (chat.recv_file.fp) {
+                fclose(chat.recv_file.fp);
+                chat.recv_file.fp = NULL;
+        }
+
         /* cleanup */
         free(peer_name);
         sodium_memzero(&ps, sizeof(ps));
         close(p2p_fd);
+        if (chat.wake_r >= 0) close(chat.wake_r);
+        if (chat.wake_w >= 0) close(chat.wake_w);
         return 0;
 }
