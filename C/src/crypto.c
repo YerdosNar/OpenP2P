@@ -82,7 +82,7 @@ fail:
         return false;
 }
 
-/* ── encrypt and send ───────────────────────────────────────────────────── */
+/* ── raw AEAD layer (no type byte, no interpretation) ───────────────────── */
 
 /*
  * Encrypt 'len' bytes from 'data' and send one packet on 'fd'.
@@ -129,8 +129,6 @@ static bool encrypt_send_raw(
         free(packet);
         return ok;
 }
-
-/* ── receive and decrypt ────────────────────────────────────────────────── */
 
 /*
  * Receive one packet on 'fd' and decrypt into a freshly-allocated buffer.
@@ -203,31 +201,141 @@ static bool recv_decrypt_raw(
         return true;
 }
 
-bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
+/* ── typed layer: prepends/strips the 1-byte MsgType ─────────────────────── */
+
+bool crypto_send_typed(
+                int32_t         fd,
+                uint8_t         type,
+                const uint8_t   *data,
+                uint32_t        len,
+                const Session   *s)
 {
-        return encrypt_send_raw(fd, (const uint8_t *)msg,
-                                (uint32_t)strlen(msg), s);
+        /*
+         * We allocate (1 + len) bytes, write the type, then memcpy the
+         * payload. The whole buffer is handed to encrypt_send_raw, which
+         * encrypts and authenticates it atomically -- so the type byte
+         * is covered by Poly1305 just like the payload.
+         *
+         * Handles len == 0 / data == NULL cleanly for empty-payload
+         * messages (accept / reject / end).
+         */
+        uint32_t plain_len = 1 + len;
+        uint8_t *plain = malloc(plain_len);
+        if (!plain) {
+                err("malloc failed (send_typed).\n");
+                return false;
+        }
+
+        plain[0] = type;
+        if (len > 0 && data != NULL) {
+                memcpy(plain + 1, data, len);
+        }
+
+        bool ok = encrypt_send_raw(fd, plain, plain_len, s);
+
+        /*
+         * Best effort to avoid leaving ciphertext-adjacent data on the heap.
+         * For chat/offer/chunk this isn't sensitive in the same way as keys,
+         * but it's cheap and keeps habits consistent.
+         */
+        sodium_memzero(plain, plain_len);
+        free(plain);
+        return ok;
 }
 
-bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s)
+bool crypto_recv_typed(
+                int32_t         fd,
+                uint8_t         *out_type,
+                uint8_t         **out_data,
+                uint32_t        *out_len,
+                const Session   *s)
 {
-        uint8_t *data = NULL;
-        uint32_t len  = 0;
-        if (!recv_decrypt_raw(fd, &data, &len, s))
-                return false;
+        uint8_t *raw = NULL;
+        uint32_t raw_len = 0;
 
-        data[len] = '\0';
-        *out_buf = (char *)data;
+        if (!recv_decrypt_raw(fd, &raw, &raw_len, s)) {
+                return false;
+        }
+
+        /*
+         * A valid plaintext must contain at least the type byte.
+         * If the peer somehow sends an empty plaintext, we treat it
+         * as a protocol error -- it can't have come from our own code.
+         */
+        if (raw_len < 1) {
+                err("Received empty plaintext (missing type byte).\n");
+                free(raw);
+                return false;
+        }
+
+        *out_type = raw[0];
+
+        /*
+         * Rather than allocate a second buffer and copy, shift the payload
+         * down by one byte inside the existing allocation. Cheaper and keeps
+         * the trailing NUL that recv_decrypt_raw already appended.
+         *
+         * memmove (not memcpy): source and destination overlap.
+         */
+        uint32_t payload_len = raw_len - 1;
+        memmove(raw, raw + 1, payload_len);
+        raw[payload_len] = '\0';
+
+        *out_data = raw;
+        *out_len  = payload_len;
         return true;
 }
 
-bool crypto_encrypt_send_bin(
-        int32_t        fd,
-        const uint8_t *data,
-        uint32_t       len,
-        const Session *s)
+/* ── legacy wrappers: always MSG_CHAT ───────────────────────────────────── */
+
+bool crypto_encrypt_send(int32_t fd, const char *msg, const Session *s)
 {
-        return encrypt_send_raw(fd, data, len, s);
+        return crypto_send_typed(fd, MSG_CHAT,
+                                 (const uint8_t *)msg,
+                                 (uint32_t)strlen(msg), s);
+}
+
+bool crypto_encrypt_send_bin(
+                int32_t         fd,
+                const uint8_t   *data,
+                uint32_t        len,
+                const Session   *s)
+{
+        return crypto_send_typed(fd, MSG_CHAT, data, len, s);
+}
+
+/*
+ * Legacy recv wrappers reject any non-chat type. Rationale:
+ *
+ *   - rendezvous.c never exchanges anything but chat-shaped data
+ *     (prompts, IP:Port strings, public-key blobs). All of it rides
+ *     under MSG_CHAT in Phase 1.
+ *   - peer.c uses these wrappers ONLY during the rendezvous conversation,
+ *     where the same rule applies.
+ *   - For the P2P chat/file channel, peer.c uses crypto_recv_typed
+ *     directly and dispatches on the type byte.
+ *
+ * A non-chat type arriving here means either a protocol mismatch or a
+ * bug -- both warrant an explicit failure rather than silent acceptance.
+ */
+bool crypto_recv_decrypt(int32_t fd, char **out_buf, const Session *s)
+{
+        uint8_t  type;
+        uint8_t *data = NULL;
+        uint32_t len  = 0;
+
+        if (!crypto_recv_typed(fd, &type, &data, &len, s)) {
+                return false;
+        }
+
+        if (type != MSG_CHAT) {
+                err("Unexpected message type 0x%02x on chat channel.\n", type);
+                free(data);
+                return false;
+        }
+
+        *out_buf = (char *)data;
+        return true;
 }
 
 bool crypto_recv_decrypt_bin(

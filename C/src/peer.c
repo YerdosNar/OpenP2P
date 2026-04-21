@@ -1,19 +1,31 @@
+/*
+ * Force 64-bit off_t even on 32-bit platforms. Must come before any
+ * system headers are pulled in, otherwise stat(2)'s st_size field may
+ * be a 32-bit value and silently truncate at 2 GiB.
+ */
+#define _FILE_OFFSET_BITS 64
+
 #include <netdb.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <libgen.h>
 #include <sodium.h>
 
 #include "../include/crypto.h"
 #include "../include/net.h"
 #include "../include/logger.h"
+#include "../include/fileproto.h"
 
 #define DEFAULT_SERVER_PORT     8888
 #define DEFAULT_LOCAL_PORT      50000
@@ -30,12 +42,31 @@ typedef struct {
         uint16_t port;
 } PeerInfo;
 
+/*
+ * Sender-side state for the file-transfer state machine.
+ *
+ *   CHAT            - default. Chat input is sent as MSG_CHAT; typing
+ *                     "/sendfile" transitions to AWAITING_ACCEPT.
+ *   AWAITING_ACCEPT - an offer has been sent; we are waiting for the
+ *                     receiver to accept or reject. Chat input will be
+ *   SENDING         - offer accepted; chunks are being streamed.
+ *
+ * The field is _Atomic because the recv_thread will transition
+ * it back to CHAT (or signal abort) while the main thread reads it.
+ */
+typedef enum {
+        CHAT_STATE_CHAT            = 0,
+        CHAT_STATE_AWAITING_ACCEPT = 1,
+        CHAT_STATE_SENDING         = 2,
+} ChatState;
+
 typedef struct {
-        int32_t         fd;
-        const Session   *session;
-        const char      *my_name;
-        const char      *peer_name;
-        volatile bool  running;
+        int32_t             fd;
+        const Session      *session;
+        const char         *my_name;
+        const char         *peer_name;
+        volatile bool       running;
+        _Atomic ChatState   state;
 } ChatCtx;
 
 static void resolve_domain(const char *domain, char *out_ip)
@@ -286,6 +317,95 @@ static  void *recv_thread(void *arg)
         return NULL;
 }
 
+static bool try_handle_sendfile_command(const char *line, ChatCtx *ctx)
+{
+        /* Accept exactly "/sendfile" or "/sendfile " (room for a path later). */
+        if (strcmp(line, "/sendfile") != 0
+            && strncmp(line, "/sendfile ", 10) != 0) {
+                return false;
+        }
+
+        char path[1024];
+        printf(BMGN "INPUT" NOC ": Path to file: ");
+        fflush(stdout);
+        if (fgets(path, sizeof(path), stdin) == NULL) {
+                /* EOF on stdin while prompting - treat as "cancelled". */
+                printf("\n");
+                return true;
+        }
+        net_strip_newline(path);
+
+        if (path[0] == '\0') {
+                warn("No path given; /sendfile cancelled.\n");
+                return true;
+        }
+
+        /* Stat it. We want to know it exists, is accessible, and is a
+         * regular file (not a directory, FIFO, or device). */
+        struct stat st;
+        if (stat(path, &st) != 0) {
+                err("Cannot access '%s'.\n", path);
+                return true;
+        }
+        if (!S_ISREG(st.st_mode)) {
+                err("'%s' is not a regular file.\n", path);
+                return true;
+        }
+
+        /*
+         * Extract the basename. basename() may modify its argument and
+         * may return a pointer INTO that argument, so we work on a
+         * mutable copy and copy the result out before the copy goes
+         * out of scope.
+         */
+        char path_copy[1024];
+        strncpy(path_copy, path, sizeof(path_copy) - 1);
+        path_copy[sizeof(path_copy) - 1] = '\0';
+
+        char *base = basename(path_copy);
+
+        /*
+         * Reject degenerate basenames. basename("/") returns "/",
+         * basename(".") returns ".", basename("..") returns "..".
+         * None of these are legitimate filenames to send.
+         */
+        if (base == NULL
+            || base[0] == '\0'
+            || strcmp(base, ".")  == 0
+            || strcmp(base, "..") == 0
+            || strcmp(base, "/")  == 0)
+        {
+                err("Could not derive a valid filename from '%s'.\n", path);
+                return true;
+        }
+
+        /*
+         * fileproto_send_offer will also enforce FILEPROTO_NAME_MAX,
+         * but we can give a friendlier message by checking here too.
+         */
+        size_t base_len = strlen(base);
+        if (base_len > FILEPROTO_NAME_MAX) {
+                err("Filename '%s' is too long (%zu > %u).\n",
+                    base, base_len, FILEPROTO_NAME_MAX);
+                return true;
+        }
+
+        uint64_t filesize = (uint64_t)st.st_size;
+
+        info("Offering '%s' (%" PRIu64 " bytes) to peer...\n",
+             base, filesize);
+
+        if (!fileproto_send_offer(ctx->fd, base, filesize, ctx->session)) {
+                err("Failed to send file offer.\n");
+                return true;
+        }
+
+        atomic_store(&ctx->state, CHAT_STATE_AWAITING_ACCEPT);
+        success("Offer sent. Waiting for peer's response...\n");
+        return true;
+}
+
+
 static void send_loop(ChatCtx *ctx)
 {
         char message[1024];
@@ -303,6 +423,13 @@ static void send_loop(ChatCtx *ctx)
                 net_strip_newline(message);
 
                 if (message[0] == '\0') continue;
+
+                /*
+                 * Commands beginning with '/' are intercepted here.
+                 * /sendfile enters the file-transfer flow instead of
+                 * being sent as a chat message.
+                 */
+                if (try_handle_sendfile_command(message, ctx)) continue;
 
                 if (!ctx->running) break;
 
@@ -442,6 +569,7 @@ int main(int argc, char **argv)
                 .my_name        = my_name,
                 .peer_name      = peer_name,
                 .running        = true,
+                .state          = CHAT_STATE_CHAT,
         };
 
         pthread_t rtid;
