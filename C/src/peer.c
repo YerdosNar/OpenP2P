@@ -9,10 +9,12 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
@@ -25,6 +27,7 @@
 #include "../include/crypto.h"
 #include "../include/net.h"
 #include "../include/logger.h"
+#include "../include/msgtype.h"
 #include "../include/fileproto.h"
 
 #define DEFAULT_SERVER_PORT     8888
@@ -43,22 +46,75 @@ typedef struct {
 } PeerInfo;
 
 /*
- * Sender-side state for the file-transfer state machine.
+ * State machine for the peer.
  *
- *   CHAT            - default. Chat input is sent as MSG_CHAT; typing
- *                     "/sendfile" transitions to AWAITING_ACCEPT.
- *   AWAITING_ACCEPT - an offer has been sent; we are waiting for the
- *                     receiver to accept or reject. Chat input will be
- *   SENDING         - offer accepted; chunks are being streamed.
+ * A single peer is always simultaneously a potential sender AND a
+ * potential receiver. Because we serialize transfers in Phase 1,
+ * only one of these situations can be true at a time -- so a single
+ * enum covers all the cases.
  *
- * The field is _Atomic because the recv_thread will transition
- * it back to CHAT (or signal abort) while the main thread reads it.
+ *   CHAT             - nothing in flight; chat flows both ways normally.
+ *   AWAITING_ACCEPT  - I sent an offer; waiting for peer's y/n.
+ *                      My chat input is suspended.
+ *   OFFERED          - Peer sent me an offer; I owe them a y/n.
+ *                      My chat input is replaced with accept/reject prompt.
+ *   SENDING          - (Step 6) I'm streaming chunks to the peer.
+ *   RECEIVING        - (Step 6) I'm consuming chunks from the peer.
+ *
+ * Transitions:
+ *
+ *   CHAT --/sendfile--> AWAITING_ACCEPT --accept--> SENDING  --END--> CHAT
+ *                                       --reject--> CHAT
+ *
+ *   CHAT --peer offer--> OFFERED --y--> RECEIVING --END--> CHAT
+ *                                --n--> CHAT
+ *
+ * The field is _Atomic because both threads read and write it.
  */
 typedef enum {
         CHAT_STATE_CHAT            = 0,
         CHAT_STATE_AWAITING_ACCEPT = 1,
-        CHAT_STATE_SENDING         = 2,
+        CHAT_STATE_OFFERED         = 2,
+        CHAT_STATE_SENDING         = 3,
+        CHAT_STATE_RECEIVING       = 4,
 } ChatState;
+
+/*
+ * Metadata stashed by recv_thread when a MSG_FILE_OFFER arrives,
+ * and later read by send_loop when it prompts the user y/n.
+ *
+ * Synchronised with 'state' via release/acquire on that atomic.
+ */
+typedef struct {
+        char     filename[FILEPROTO_NAME_MAX + 1];
+        uint64_t filesize;
+} PendingOffer;
+
+/*
+ * Sender-side bookkeeping: the path to reopen once the peer accepts,
+ * and the size we promised them (so the chunk loop can stop precisely
+ * at the size we declared in the offer).
+ *
+ * Populated by try_handle_sendfile_command right before it transitions
+ * state to AWAITING_ACCEPT. Read by do_send_file_chunks.
+ */
+typedef struct {
+        char     path[1024];
+        char     basename[FILEPROTO_NAME_MAX + 1];
+        uint64_t filesize;
+} SendingState;
+
+/*
+ * Receiver-side bookkeeping for an in-progress file write.
+ * Opened by the y-branch of prompt_while_offered, written by
+ * handle_recv_file_chunk, closed by handle_recv_file_end.
+ */
+typedef struct {
+        FILE    *fp;                        /* NULL when no transfer active  */
+        char     final_path[1024];          /* where we're actually writing  */
+        uint64_t expected_size;             /* as promised in the offer      */
+        uint64_t received;                  /* running total, <= expected    */
+} RecvFileState;
 
 typedef struct {
         int32_t             fd;
@@ -67,6 +123,9 @@ typedef struct {
         const char         *peer_name;
         volatile bool       running;
         _Atomic ChatState   state;
+        PendingOffer        pending;
+        SendingState        sending;
+        RecvFileState       recv_file;
 } ChatCtx;
 
 static void resolve_domain(const char *domain, char *out_ip)
@@ -287,36 +346,424 @@ static int32_t do_hole_punch(
         return -1;
 }
 
+/* ── helpers for recv_thread ──────────────────────────────────────────────
+ *
+ * Print a full-line notice from recv_thread without stomping the
+ * active send_loop prompt. Same trick the chat printer already uses:
+ *   \r          move to column 0
+ *   \033[2K     clear the line
+ *
+ * We do NOT reprint the send_loop prompt here, because after a file
+ * event the prompt that send_loop wants to show depends on the new
+ * state (it might be "Accept? [y/n]: " now, not "<name>: "). So we
+ * just end with "\n" and let send_loop redraw on its next iteration.
+ */
+static void recv_print_notice(const char *fmt, ...)
+{
+        va_list ap;
+        va_start(ap, fmt);
+        printf("\r\033[2K");
+        vprintf(fmt, ap);
+        va_end(ap);
+        fflush(stdout);
+}
+
+/*
+ * Handle FILE_OFFER. Parses the payload, stashes the metadata
+ * in ctx->pending, and transitions state CHAT -> OFFERED.
+ *
+ * If we're not in CHAT (e.g. we have our own offer outstanding),
+ * we auto-reject and stay where we are. This prevents offer collisions.
+ */
+static void handle_recv_file_offer(ChatCtx *ctx,
+                                   const uint8_t *payload, uint32_t len)
+{
+        char     name[FILEPROTO_NAME_MAX + 1];
+        uint64_t size;
+        if (!fileproto_parse_offer(payload, len, name, sizeof(name), &size)) {
+                recv_print_notice(BRED "[x]" NOC
+                                  " Malformed file offer from peer.\n");
+                return;
+        }
+
+        /*
+         * Guard against collisions: we only accept offers while in CHAT.
+         * If we're busy (our own AWAITING_ACCEPT, or already OFFERED),
+         * we auto-reject the incoming offer so the peer doesn't hang.
+         */
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_CHAT) {
+                recv_print_notice(BYEL "[!]" NOC
+                                  " Auto-rejecting '%s' (busy with another transfer).\n",
+                                  name);
+                fileproto_send_reject(ctx->fd, ctx->session);
+                return;
+        }
+
+        /*
+         * Populate pending BEFORE publishing the state change. The
+         * release-store on state pairs with the acquire-load in
+         * send_loop, so once send_loop sees OFFERED it is guaranteed
+         * to see these writes too.
+         */
+        strncpy(ctx->pending.filename, name, sizeof(ctx->pending.filename) - 1);
+        ctx->pending.filename[sizeof(ctx->pending.filename) - 1] = '\0';
+        ctx->pending.filesize = size;
+
+        atomic_store_explicit(&ctx->state, CHAT_STATE_OFFERED,
+                              memory_order_release);
+
+        recv_print_notice(BMGN "[offer]" NOC
+                          " %s wants to send '%s' (%" PRIu64 " bytes).\n",
+                          ctx->peer_name, name, size);
+}
+
+/*
+ * Handle FILE_ACCEPT from the peer.
+ * Valid only when we were AWAITING_ACCEPT. In Step 5 this just
+ * transitions back to CHAT; Step 6 will transition to SENDING and
+ * trigger the chunk loop.
+ */
+static void handle_recv_file_accept(ChatCtx *ctx)
+{
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_AWAITING_ACCEPT) {
+                recv_print_notice(BYEL "[!]" NOC
+                                  " Unexpected ACCEPT in state %d; ignoring.\n",
+                                  (int)s);
+                return;
+        }
+        /*
+         * Transition to SENDING. The main thread's prompt_while_awaiting_accept
+         * will notice this on its next stdin wakeup (when the user hits Enter)
+         * and dispatch to do_send_file_chunks. This stdin-wakeup dependency
+         * is documented; a self-pipe wakeup is Step 8 territory.
+         */
+        atomic_store_explicit(&ctx->state, CHAT_STATE_SENDING,
+                              memory_order_release);
+        recv_print_notice(BGRN "[ok]" NOC
+                          " Peer accepted. Press Enter to start sending.\n");
+}
+
+static void handle_recv_file_reject(ChatCtx *ctx)
+{
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_AWAITING_ACCEPT) {
+                recv_print_notice(BYEL "[!]" NOC
+                                  " Unexpected REJECT in state %d; ignoring.\n",
+                                  (int)s);
+                return;
+        }
+        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                              memory_order_release);
+        recv_print_notice(BYEL "[!]" NOC " Peer rejected the offer.\n");
+}
+
+/* ── safe filename helpers (receiver side) ────────────────────────────────
+ *
+ * Defence-in-depth: even though the sender promised to basename() the
+ * filename before sending the offer, we re-validate on receive. A
+ * compromised or buggy peer must not be able to make us write
+ * anywhere except the current directory.
+ *
+ * Returns true if name is safe (no directory components, no traversal).
+ */
+static bool filename_is_safe(const char *name)
+{
+        if (name == NULL || name[0] == '\0') return false;
+        if (strcmp(name, ".")  == 0)         return false;
+        if (strcmp(name, "..") == 0)         return false;
+        if (strchr(name, '/'))               return false;
+        if (strchr(name, '\\'))              return false;
+        /* Leading dot is allowed (many legit files start with one) but a
+         * bare "." / ".." we already caught above. */
+        return true;
+}
+
+/*
+ * Resolve a filename collision by appending " (N)" before the extension.
+ * "report.pdf" -> "report (1).pdf" -> "report (2).pdf" ...
+ * "notes"      -> "notes (1)"      -> "notes (2)" ...
+ *
+ * Writes the chosen (non-existing) path into out / out_cap. Returns
+ * true on success, false if we ran out of attempts or out_cap is too
+ * small.
+ */
+static bool resolve_output_path(const char *name,
+                                char *out, size_t out_cap)
+{
+        /* First try: name itself. */
+        if ((size_t)snprintf(out, out_cap, "./%s", name) >= out_cap)
+                return false;
+        if (access(out, F_OK) != 0) return true;
+
+        /* Find the last '.' to split basename/extension (both optional). */
+        const char *dot = strrchr(name, '.');
+        size_t stem_len = dot ? (size_t)(dot - name) : strlen(name);
+        const char *ext  = dot ? dot : "";
+
+        for (int i = 1; i < 1000; i++) {
+                int n = snprintf(out, out_cap, "./%.*s (%d)%s",
+                                 (int)stem_len, name, i, ext);
+                if (n < 0 || (size_t)n >= out_cap) return false;
+                if (access(out, F_OK) != 0) return true;
+        }
+        return false;
+}
+
+/* ── sender-side chunk loop ───────────────────────────────────────────────
+ *
+ * Called from prompt_while_awaiting_accept AFTER state has become
+ * SENDING (which recv_thread transitions to when it gets ACCEPT).
+ *
+ * Reads ctx->sending.path in chunks of FILEPROTO_CHUNK_SIZE, encrypts
+ * each one via fileproto_send_chunk, and ends with fileproto_send_end.
+ *
+ * On completion (success OR failure) state goes back to CHAT.
+ * Returns true if the caller should continue the send_loop, false if
+ * the connection should be torn down.
+ */
+static bool do_send_file_chunks(ChatCtx *ctx)
+{
+        const char *path = ctx->sending.path;
+        uint64_t    size = ctx->sending.filesize;
+
+        FILE *fp = fopen(path, "rb");
+        if (!fp) {
+                err("Cannot reopen '%s' for sending.\n", path);
+                atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                      memory_order_release);
+                /* Send an END anyway so the peer doesn't hang waiting. */
+                fileproto_send_end(ctx->fd, ctx->session);
+                return true;
+        }
+
+        info("Sending '%s' (%" PRIu64 " bytes)...\n",
+             ctx->sending.basename, size);
+
+        uint8_t  buf[FILEPROTO_CHUNK_SIZE];
+        uint64_t sent = 0;
+        bool     ok   = true;
+        time_t   t0   = time(NULL);
+
+        while (sent < size) {
+                /*
+                 * Read at most min(CHUNK_SIZE, size-sent) bytes. The
+                 * size cap matters on the final chunk: if the file on
+                 * disk grew or shrank between stat() and now, we stick
+                 * to the size we promised in the offer. Mismatch is
+                 * handled as a truncated read below.
+                 */
+                size_t want = FILEPROTO_CHUNK_SIZE;
+                uint64_t remaining = size - sent;
+                if (remaining < want) want = (size_t)remaining;
+
+                size_t got = fread(buf, 1, want, fp);
+                if (got == 0) {
+                        err("Short read on '%s' at offset %" PRIu64
+                            " (file shrank?).\n", path, sent);
+                        ok = false;
+                        break;
+                }
+
+                if (!fileproto_send_chunk(ctx->fd, buf, (uint32_t)got,
+                                          ctx->session)) {
+                        err("Failed to send chunk at offset %" PRIu64 ".\n", sent);
+                        ok = false;
+                        break;
+                }
+
+                sent += got;
+        }
+
+        fclose(fp);
+
+        /*
+         * Always send END -- on success to signal normal completion, on
+         * failure so the peer doesn't hang forever waiting for more
+         * chunks. (In Phase 2's secretstream, TAG_FINAL replaces this.)
+         */
+        fileproto_send_end(ctx->fd, ctx->session);
+
+        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                              memory_order_release);
+
+        if (ok) {
+                time_t dt = time(NULL) - t0;
+                if (dt < 1) dt = 1;
+                double mbps = ((double)sent / (1024.0 * 1024.0)) / (double)dt;
+                success("Sent '%s' (%" PRIu64 " bytes) in %lds (~%.1f MB/s).\n",
+                        ctx->sending.basename, sent, (long)dt, mbps);
+        } else {
+                err("Transfer of '%s' aborted after %" PRIu64 " bytes.\n",
+                    ctx->sending.basename, sent);
+        }
+        return true;
+}
+
+/* ── receiver-side chunk/end handlers ─────────────────────────────────────
+ *
+ * Called from recv_thread's dispatch on MSG_FILE_CHUNK / MSG_FILE_END.
+ * handle_recv_file_chunk writes to ctx->recv_file.fp and bumps the
+ * received counter, enforcing received <= expected_size.
+ * handle_recv_file_end closes the file and validates totals.
+ */
+static void abort_recv_file(ChatCtx *ctx, const char *why)
+{
+        if (ctx->recv_file.fp) {
+                fclose(ctx->recv_file.fp);
+                ctx->recv_file.fp = NULL;
+                /* Leave the partial file on disk so the user can inspect
+                 * it; naming it ".part" is Step 8 territory. */
+        }
+        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                              memory_order_release);
+        recv_print_notice(BRED "[x]" NOC " File receive aborted: %s\n", why);
+}
+
+static void handle_recv_file_chunk(ChatCtx *ctx,
+                                   const uint8_t *payload, uint32_t len)
+{
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_RECEIVING || ctx->recv_file.fp == NULL) {
+                recv_print_notice(BYEL "[!]" NOC
+                                  " Unexpected CHUNK in state %d; dropping.\n",
+                                  (int)s);
+                return;
+        }
+        if (len == 0 || len > FILEPROTO_CHUNK_MAX) {
+                abort_recv_file(ctx, "chunk size out of range");
+                return;
+        }
+
+        /* Invariant: received + len <= expected_size. Protects against
+         * a misbehaving peer sending more than promised. */
+        if ((uint64_t)len > ctx->recv_file.expected_size - ctx->recv_file.received) {
+                abort_recv_file(ctx, "peer sent more data than declared");
+                return;
+        }
+
+        size_t written = fwrite(payload, 1, len, ctx->recv_file.fp);
+        if (written != (size_t)len) {
+                abort_recv_file(ctx, "disk write failed");
+                return;
+        }
+        ctx->recv_file.received += len;
+}
+
+static void handle_recv_file_end(ChatCtx *ctx)
+{
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_RECEIVING) {
+                recv_print_notice(BYEL "[!]" NOC
+                                  " Unexpected END in state %d; ignoring.\n",
+                                  (int)s);
+                return;
+        }
+        if (ctx->recv_file.fp == NULL) {
+                atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                      memory_order_release);
+                return;
+        }
+
+        fclose(ctx->recv_file.fp);
+        ctx->recv_file.fp = NULL;
+
+        uint64_t got  = ctx->recv_file.received;
+        uint64_t want = ctx->recv_file.expected_size;
+
+        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                              memory_order_release);
+
+        if (got == want) {
+                recv_print_notice(BGRN "[ok]" NOC
+                                  " Received '%s' (%" PRIu64 " bytes).\n",
+                                  ctx->recv_file.final_path, got);
+        } else {
+                recv_print_notice(BRED "[x]" NOC
+                                  " Truncated receive of '%s': %" PRIu64
+                                  " / %" PRIu64 " bytes on disk.\n",
+                                  ctx->recv_file.final_path, got, want);
+        }
+}
+
 static  void *recv_thread(void *arg)
 {
         ChatCtx *ctx = arg;
 
         while (ctx->running) {
-                char *peer_msg = NULL;
-                if (!crypto_recv_decrypt(ctx->fd, &peer_msg, ctx->session)) {
+                uint8_t  type = 0;
+                uint8_t *payload = NULL;
+                uint32_t len = 0;
+
+                if (!crypto_recv_typed(ctx->fd, &type, &payload, &len, ctx->session)) {
                         if (ctx->running) {
                                 ctx->running = false;
                                 printf("\n[%s disconnected.]\n", ctx->peer_name);
                                 shutdown(ctx->fd, SHUT_RDWR);
                         }
+                        free(payload);
                         break;
                 }
-                /*
-                 * Erase the current input prompt, print the incoming message,
-                 * then reprint the prompt so the user can keep typing.
-                 *
-                 * \r          = move cursor to column 0
-                 * \033[2K     = clear entire current line
-                 */
-                printf("\r\033[2K%s: %s\n%s: ",
-                       ctx->peer_name, peer_msg, ctx->my_name);
-                fflush(stdout);
-                free(peer_msg);
+
+                switch (type) {
+                case MSG_CHAT:
+                        /* Preserve the existing chat-printing UX:
+                         * erase current input, print message, reprint
+                         * the user's prompt so they can keep typing. */
+                        printf("\r\033[2K%s: %s\n%s: ",
+                               ctx->peer_name, (const char *)payload,
+                               ctx->my_name);
+                        fflush(stdout);
+                        break;
+
+                case FILE_OFFER:
+                        handle_recv_file_offer(ctx, payload, len);
+                        break;
+
+                case FILE_ACCEPT:
+                        handle_recv_file_accept(ctx);
+                        break;
+
+                case FILE_REJECT:
+                        handle_recv_file_reject(ctx);
+                        break;
+
+                case FILE_CHUNK:
+                        handle_recv_file_chunk(ctx, payload, len);
+                        break;
+
+                case FILE_EOF:
+                        handle_recv_file_end(ctx);
+                        break;
+
+                default:
+                        err("Unknown message type 0x%02x from peer.\n", type);
+                        ctx->running = false;
+                        shutdown(ctx->fd, SHUT_RDWR);
+                        break;
+                }
+
+                free(payload);
         }
 
         return NULL;
 }
 
+/* ── /sendfile command ────────────────────────────────────────────────────
+ *
+ * Returns true if 'line' is the /sendfile command (whether or not the
+ * subsequent send succeeded). The caller should 'continue' the send
+ * loop in that case, because the line is not a chat message.
+ *
+ * On successful offer send, the state transitions to AWAITING_ACCEPT.
+ * On any failure (bad path, not a regular file, send error) the state
+ * stays at CHAT and the user can try again.
+ *
+ * NOTE (Step 4): The actual input blocking while in AWAITING_ACCEPT
+ * is deferred to Step 5, along with receiver-side offer handling and
+ * the accept/reject path. This function just sends the offer.
+ */
 static bool try_handle_sendfile_command(const char *line, ChatCtx *ctx)
 {
         /* Accept exactly "/sendfile" or "/sendfile " (room for a path later). */
@@ -325,6 +772,18 @@ static bool try_handle_sendfile_command(const char *line, ChatCtx *ctx)
                 return false;
         }
 
+        /*
+         * Offers are only legal from CHAT state. If we already have
+         * an offer outstanding (either direction), refuse and tell the
+         * user.
+         */
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s != CHAT_STATE_CHAT) {
+                warn("Cannot start /sendfile now -- another transfer is in progress.\n");
+                return true;
+        }
+
+        /* Prompt for a path on the next line. */
         char path[1024];
         printf(BMGN "INPUT" NOC ": Path to file: ");
         fflush(stdout);
@@ -395,22 +854,211 @@ static bool try_handle_sendfile_command(const char *line, ChatCtx *ctx)
         info("Offering '%s' (%" PRIu64 " bytes) to peer...\n",
              base, filesize);
 
+        /*
+         * Populate ctx->sending BEFORE publishing the state change,
+         * so the release-store on state synchronises both the path
+         * and the new state with the recv_thread.
+         */
+        strncpy(ctx->sending.path, path, sizeof(ctx->sending.path) - 1);
+        ctx->sending.path[sizeof(ctx->sending.path) - 1] = '\0';
+        strncpy(ctx->sending.basename, base, sizeof(ctx->sending.basename) - 1);
+        ctx->sending.basename[sizeof(ctx->sending.basename) - 1] = '\0';
+        ctx->sending.filesize = filesize;
+
         if (!fileproto_send_offer(ctx->fd, base, filesize, ctx->session)) {
                 err("Failed to send file offer.\n");
                 return true;
         }
 
-        atomic_store(&ctx->state, CHAT_STATE_AWAITING_ACCEPT);
+        atomic_store_explicit(&ctx->state, CHAT_STATE_AWAITING_ACCEPT,
+                              memory_order_release);
         success("Offer sent. Waiting for peer's response...\n");
         return true;
 }
 
+
+/* ── state-aware prompts for send_loop ────────────────────────────────────
+ *
+ * These helpers are called from the top of send_loop when state is not
+ * CHAT. They each read one line from stdin and return:
+ *   true  -- a state transition happened (or the user just pressed Enter);
+ *            send_loop should 'continue' its outer loop.
+ *   false -- EOF on stdin; send_loop should shut down.
+ */
+
+/*
+ * AWAITING_ACCEPT prompt: we sent an offer and are waiting for the
+ * peer's decision. We still want to accept stdin (otherwise the user's
+ * terminal feels frozen) but we silently discard whatever they type.
+ * A bare Enter just redraws the prompt.
+ */
+static bool prompt_while_awaiting_accept(ChatCtx *ctx)
+{
+        char buf[256];
+        printf(BYEL "[waiting for peer]" NOC ": ");
+        fflush(stdout);
+        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                ctx->running = false;
+                printf("\n[You left the chat.]\n");
+                shutdown(ctx->fd, SHUT_RDWR);
+                return false;
+        }
+        /*
+         * While we were blocked on fgets, recv_thread may have received
+         * ACCEPT (state -> SENDING) or REJECT (state -> CHAT). If we're
+         * now in SENDING, drive the chunk loop from this thread.
+         */
+        ChatState s = atomic_load_explicit(&ctx->state, memory_order_acquire);
+        if (s == CHAT_STATE_SENDING) {
+                return do_send_file_chunks(ctx);
+        }
+        /* Otherwise: discard. State will change when recv_thread processes
+         * ACCEPT or REJECT. */
+        return true;
+}
+
+/*
+ * OFFERED prompt: peer sent us an offer and we owe them a decision.
+ * Read y/Y/yes or n/N/no; anything else just reprompts.
+ * On decision, send ACCEPT or REJECT and transition back to CHAT.
+ * (Step 6 will transition ACCEPT -> RECEIVING instead.)
+ */
+static bool prompt_while_offered(ChatCtx *ctx)
+{
+        char buf[64];
+        printf(BMGN "[offer]" NOC " Accept '%s' (%" PRIu64 " bytes)? [y/n]: ",
+               ctx->pending.filename, ctx->pending.filesize);
+        fflush(stdout);
+
+        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                ctx->running = false;
+                printf("\n[You left the chat.]\n");
+                shutdown(ctx->fd, SHUT_RDWR);
+                return false;
+        }
+        net_strip_newline(buf);
+
+        if (buf[0] == 'y' || buf[0] == 'Y') {
+                /*
+                 * Defence-in-depth: re-validate the filename before we
+                 * touch the filesystem. The sender already basename()'d it,
+                 * but we never trust the wire.
+                 */
+                const char *safe_name = ctx->pending.filename;
+                if (!filename_is_safe(safe_name)) {
+                        warn("Peer-supplied filename '%s' looks unsafe;"
+                             " falling back to 'received.bin'.\n", safe_name);
+                        safe_name = "received.bin";
+                }
+
+                char out_path[1024];
+                if (!resolve_output_path(safe_name, out_path, sizeof(out_path))) {
+                        err("Could not pick a non-colliding output path for '%s'.\n",
+                            safe_name);
+                        fileproto_send_reject(ctx->fd, ctx->session);
+                        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                              memory_order_release);
+                        return true;
+                }
+
+                FILE *fp = fopen(out_path, "wb");
+                if (!fp) {
+                        err("Cannot open '%s' for writing.\n", out_path);
+                        fileproto_send_reject(ctx->fd, ctx->session);
+                        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                              memory_order_release);
+                        return true;
+                }
+
+                /* Prime recv_file BEFORE publishing RECEIVING, so the next
+                 * CHUNK that arrives on recv_thread can find fp != NULL. */
+                ctx->recv_file.fp            = fp;
+                ctx->recv_file.expected_size = ctx->pending.filesize;
+                ctx->recv_file.received      = 0;
+                strncpy(ctx->recv_file.final_path, out_path,
+                        sizeof(ctx->recv_file.final_path) - 1);
+                ctx->recv_file.final_path[sizeof(ctx->recv_file.final_path) - 1] = '\0';
+
+                if (!fileproto_send_accept(ctx->fd, ctx->session)) {
+                        err("Failed to send accept.\n");
+                        fclose(fp);
+                        ctx->recv_file.fp = NULL;
+                        atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                              memory_order_release);
+                        return true;
+                }
+
+                atomic_store_explicit(&ctx->state, CHAT_STATE_RECEIVING,
+                                      memory_order_release);
+                success("Offer accepted. Saving to '%s'. Receiving...\n",
+                        out_path);
+                return true;
+        }
+
+        if (buf[0] == 'n' || buf[0] == 'N') {
+                if (!fileproto_send_reject(ctx->fd, ctx->session)) {
+                        err("Failed to send reject.\n");
+                        return true;
+                }
+                atomic_store_explicit(&ctx->state, CHAT_STATE_CHAT,
+                                      memory_order_release);
+                warn("Offer rejected.\n");
+                return true;
+        }
+
+        /* Anything else -- just reprompt on the next iteration. */
+        return true;
+}
 
 static void send_loop(ChatCtx *ctx)
 {
         char message[1024];
 
         while (ctx->running) {
+                /*
+                 * Branch on our current state. Chat is the common case;
+                 * the non-chat states are handled by dedicated prompt
+                 * helpers so the chat path stays readable.
+                 */
+                ChatState s = atomic_load_explicit(&ctx->state,
+                                                   memory_order_acquire);
+
+                if (s == CHAT_STATE_AWAITING_ACCEPT) {
+                        if (!prompt_while_awaiting_accept(ctx)) break;
+                        continue;
+                }
+                if (s == CHAT_STATE_OFFERED) {
+                        if (!prompt_while_offered(ctx)) break;
+                        continue;
+                }
+                if (s == CHAT_STATE_RECEIVING) {
+                        /*
+                         * recv_thread is busy writing chunks to disk.
+                         * Block chat input with a quiet prompt until
+                         * the transfer finishes and state returns to CHAT.
+                         */
+                        char buf[256];
+                        printf(BYEL "[receiving file]" NOC ": ");
+                        fflush(stdout);
+                        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                                ctx->running = false;
+                                printf("\n[You left the chat.]\n");
+                                shutdown(ctx->fd, SHUT_RDWR);
+                                break;
+                        }
+                        continue;
+                }
+                if (s == CHAT_STATE_SENDING) {
+                        /*
+                         * This should not normally be reached -- the main
+                         * thread enters SENDING from prompt_while_awaiting_accept
+                         * and does not return here until state is CHAT again.
+                         * Included as a defensive no-op fallthrough.
+                         */
+                        continue;
+                }
+                /* CHAT path below. */
+
                 printf("%s: ", ctx->my_name);
                 fflush(stdout);
 
@@ -570,6 +1218,8 @@ int main(int argc, char **argv)
                 .peer_name      = peer_name,
                 .running        = true,
                 .state          = CHAT_STATE_CHAT,
+                /* .pending, .sending, .recv_file are zero-initialised by
+                 * C's designated-init rule: all unmentioned fields get 0. */
         };
 
         pthread_t rtid;
