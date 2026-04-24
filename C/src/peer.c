@@ -1384,18 +1384,22 @@ static void send_loop(ChatCtx *ctx)
                 if (s == CHAT_STATE_RECEIVING) {
                         /*
                          * recv_thread is busy writing chunks to disk.
-                         * Block chat input with a quiet prompt until
-                         * the transfer finishes and state returns to CHAT.
+                         * Block chat input with a quiet prompt; the wake
+                         * pipe ensures we exit promptly when the transfer
+                         * completes and state returns to CHAT.
                          */
                         char buf[256];
                         printf(BYEL "[receiving file]" NOC ": ");
                         fflush(stdout);
-                        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+                        InputResult r = wait_for_line_or_wake(ctx, buf, sizeof(buf));
+                        if (r == INPUT_EOF) {
                                 ctx->running = false;
                                 printf("\n[You left the chat.]\n");
                                 shutdown(ctx->fd, SHUT_RDWR);
                                 break;
                         }
+                        if (r == INPUT_ERROR) break;
+                        /* GOT_LINE or WOKEN -- either way, loop and re-check state */
                         continue;
                 }
                 if (s == CHAT_STATE_SENDING) {
@@ -1412,13 +1416,28 @@ static void send_loop(ChatCtx *ctx)
                 printf("%s: ", ctx->my_name);
                 fflush(stdout);
 
-                if (fgets(message, sizeof(message), stdin) == NULL) {
-                        ctx->running = false;
-                        printf("\n[You left the chat.]\n");
-                        shutdown(ctx->fd, SHUT_RDWR);
-                        break;
+                {
+                        InputResult r = wait_for_line_or_wake(ctx, message,
+                                                              sizeof(message));
+                        if (r == INPUT_EOF) {
+                                ctx->running = false;
+                                printf("\n[You left the chat.]\n");
+                                shutdown(ctx->fd, SHUT_RDWR);
+                                break;
+                        }
+                        if (r == INPUT_ERROR) break;
+                        if (r == INPUT_WOKEN) {
+                                /*
+                                 * recv_thread published a state change
+                                 * (e.g. an OFFER arrived). Loop back so
+                                 * the top of send_loop can dispatch to
+                                 * the right prompt for the new state.
+                                 */
+                                continue;
+                        }
+                        /* r == INPUT_GOT_LINE; message is NUL-terminated,
+                         * newline already stripped by the helper. */
                 }
-                net_strip_newline(message);
 
                 if (message[0] == '\0') continue;
 
