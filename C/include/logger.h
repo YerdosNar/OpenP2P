@@ -1,6 +1,8 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
+#include <stdbool.h>
+
 #define BRED "\033[41m"
 #define BGRN "\033[42m"
 #define BYEL "\033[43m"
@@ -16,6 +18,9 @@
 #define  CYN "\033[36m"
 
 #define NOC "\033[0m"
+
+extern bool g_debug;
+void logger_set_debug(bool on);
 
 void info       (const char *msg, ...);
 void success    (const char *msg, ...);

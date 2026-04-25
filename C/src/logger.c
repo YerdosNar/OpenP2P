@@ -3,7 +3,11 @@
 
 #include "../include/logger.h"
 
+bool g_debug = false;
+void logger_set_debug(bool on) { g_debug = on; }
+
 void info(const char *msg, ...) {
+        if (!g_debug) return;
         va_list args;
         va_start(args, msg);
 
@@ -14,6 +18,7 @@ void info(const char *msg, ...) {
 }
 
 void warn(const char *msg, ...) {
+        if (!g_debug) return;
         va_list args;
         va_start(args, msg);
 
@@ -34,6 +39,7 @@ void success(const char *msg, ...) {
 }
 
 void err(const char *msg, ...) {
+        if (!g_debug) return;
         va_list args;
         va_start(args, msg);
 

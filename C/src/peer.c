@@ -47,6 +47,7 @@ typedef struct {
         char     server_ip[MAX_IP_LEN];
         uint16_t server_port;
         uint16_t local_port;
+        bool     debug;
 } Config;
 
 typedef struct {
@@ -179,6 +180,7 @@ static void usage(const char *exe)
         printf("  -l, --local-port <port>     Local port for P2P      (default=%d)\n",
                DEFAULT_LOCAL_PORT);
         printf("  -d, --domain-name <name>    Rendezvous server domain\n");
+        printf("  --debug                     Debug mode, prints all steps info\n");
         printf("  -h, --help                  Show this help message\n\n");
         printf("Example:\n  %s -d example.com -s 8888\n", exe);
 }
@@ -189,6 +191,7 @@ static Config parse_args(int argc, char **argv)
         strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
         cfg.server_port = DEFAULT_SERVER_PORT;
         cfg.local_port  = DEFAULT_LOCAL_PORT;
+        cfg.debug = false;
 
         for (int i = 1; i < argc; i++) {
                 if (!strncmp(argv[i], "-s", 2)
@@ -215,6 +218,7 @@ static Config parse_args(int argc, char **argv)
                         if (i + 1 < argc)
                                 resolve_domain(argv[++i], cfg.server_ip);
                 }
+                else if (!strncmp(argv[i], "--debug", 7)) cfg.debug = true;
                 else if (!strncmp(argv[i], "-h", 2)
                          || !strncmp(argv[i], "--help", 6))
                 {
