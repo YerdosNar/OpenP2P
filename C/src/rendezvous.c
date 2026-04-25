@@ -35,6 +35,7 @@ static void usage(const char *exe)
                DEFAULT_LOG_FILE);
         printf("  -m, --max-rooms <n>      Max rooms in queue      (default=%d)\n",
                MAX_ROOMS);
+        printf("  --debug                     Debug mode, prints all steps info\n");
         printf("  -h, --help               Show this help message\n\n");
         printf("Example:\n  %s -p 2222 -l server.log\n", exe);
         exit(1);
@@ -317,6 +318,7 @@ int main(int argc, char **argv)
                         else warn("No number provided. Default: %d\n",
                                     MAX_ROOMS);
                 }
+                else if (!strncmp(argv[i], "--debug", 7)) logger_set_debug(true);
                 else if (!strncmp(argv[i], "-h", 2)
                          || !strncmp(argv[i], "--help", 6))
                 {

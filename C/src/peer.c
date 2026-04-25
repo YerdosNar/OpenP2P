@@ -47,7 +47,6 @@ typedef struct {
         char     server_ip[MAX_IP_LEN];
         uint16_t server_port;
         uint16_t local_port;
-        bool     debug;
 } Config;
 
 typedef struct {
@@ -191,7 +190,6 @@ static Config parse_args(int argc, char **argv)
         strncpy(cfg.server_ip, "127.0.0.1", MAX_IP_LEN - 1);
         cfg.server_port = DEFAULT_SERVER_PORT;
         cfg.local_port  = DEFAULT_LOCAL_PORT;
-        cfg.debug = false;
 
         for (int i = 1; i < argc; i++) {
                 if (!strncmp(argv[i], "-s", 2)
@@ -218,7 +216,7 @@ static Config parse_args(int argc, char **argv)
                         if (i + 1 < argc)
                                 resolve_domain(argv[++i], cfg.server_ip);
                 }
-                else if (!strncmp(argv[i], "--debug", 7)) cfg.debug = true;
+                else if (!strncmp(argv[i], "--debug", 7)) logger_set_debug(true);
                 else if (!strncmp(argv[i], "-h", 2)
                          || !strncmp(argv[i], "--help", 6))
                 {

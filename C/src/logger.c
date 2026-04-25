@@ -29,6 +29,7 @@ void warn(const char *msg, ...) {
 }
 
 void success(const char *msg, ...) {
+        if (!g_debug) return;
         va_list args;
         va_start(args, msg);
 
